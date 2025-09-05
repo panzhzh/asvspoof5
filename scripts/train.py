@@ -44,8 +44,8 @@ def get_loader(database_path: Path, seed: int, config: dict, test_mode: bool = F
     trn_database_path = database_path / "flac_T/"
     dev_database_path = database_path / "flac_D/"
 
-    trn_list_path = database_path / "ASVspoof5.train.metainfor.txt"
-    dev_trial_path = database_path / "ASVspoof5.dev.metainfor.txt"
+    trn_list_path = database_path / "ASVspoof5.train.tsv"
+    dev_trial_path = database_path / "ASVspoof5.dev.track_1.tsv"
 
     d_label_trn, file_train = genSpoof_list(dir_meta=trn_list_path, is_train=True, is_eval=False)
     if test_mode:

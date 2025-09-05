@@ -79,4 +79,3 @@ python scripts/train.py --eval            # Evaluation mode
 The project expects data in `data/ASVspoof5/` with:
 - `flac_T/`: Training audio (182,357 files)  
 - `flac_D/`: Development audio (142,134 files)
-- Protocol files: `ASVspoof5.train.metainfor.txt`, `ASVspoof5.dev.metainfor.txt`

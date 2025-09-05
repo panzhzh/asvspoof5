@@ -39,10 +39,10 @@ def get_model(model_config: dict, device: torch.device):
     return model
 
 
-def get_loader(database_path: Path, seed: int, config: dict, test_mode: bool = False):
-    """Make PyTorch DataLoaders for train / development"""
-    trn_database_path = database_path / "flac_T/"
-    dev_database_path = database_path / "flac_D/"
+def get_loader(database_path: Path, feature_path: Path, seed: int, config: dict, test_mode: bool = False):
+    """Make PyTorch DataLoaders for train / development using pre-extracted features"""
+    trn_feature_path = feature_path / "train"
+    dev_feature_path = feature_path / "dev"
 
     trn_list_path = database_path / "ASVspoof5.train.tsv"
     dev_trial_path = database_path / "ASVspoof5.dev.track_1.tsv"
@@ -54,7 +54,7 @@ def get_loader(database_path: Path, seed: int, config: dict, test_mode: bool = F
         d_label_trn = {k: v for k, v in d_label_trn.items() if k in file_train_set}
     print("no. training files:", len(file_train))
 
-    train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, base_dir=trn_database_path)
+    train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, feature_dir=trn_feature_path)
     gen = torch.Generator()
     gen.manual_seed(seed)
     trn_loader = DataLoader(
@@ -74,7 +74,7 @@ def get_loader(database_path: Path, seed: int, config: dict, test_mode: bool = F
         file_dev = file_dev[:2000]
     print("no. validation files:", len(file_dev))
 
-    dev_set = TestDataset(list_IDs=file_dev, base_dir=dev_database_path)
+    dev_set = TestDataset(list_IDs=file_dev, feature_dir=dev_feature_path)
     dev_loader = DataLoader(
         dev_set,
         batch_size=config["batch_size"],
@@ -103,9 +103,18 @@ def produce_evaluation_file(data_loader: DataLoader, model, device: torch.device
 
     with open(save_path, "w") as fh:
         for fn, sco, trl in zip(fname_list, score_list, trial_lines):
-            spk_id, utt_id, _, _, src, key = trl.strip().split(' ')
-            assert fn == utt_id
-            fh.write("{} {} {} {}\n".format(spk_id, utt_id, sco, key))
+            fields = trl.strip().split()
+            # TSV format: original_id file_id gender codec_type track original_speaker codec algorithm label -
+            if len(fields) >= 9:
+                original_id = fields[0]  # E.g., T_4850
+                file_id = fields[1]      # E.g., T_0000000000
+                label = fields[8]        # spoof/bonafide
+                assert fn == file_id, f"File ID mismatch: {fn} != {file_id}"
+                fh.write("{} {} {} {}\n".format(original_id, file_id, sco, label))
+            else:
+                # Fallback for shorter format
+                print(f"Warning: Unexpected line format: {trl.strip()}")
+                continue
     print("Scores saved to {}".format(save_path))
 
 
@@ -144,10 +153,32 @@ def train_epoch(trn_loader: DataLoader,
     return running_loss
 
 
+def load_config(config_path: str) -> dict:
+    """Load configuration from either JSON or Python file"""
+    config_path = Path(config_path)
+    
+    if config_path.suffix == '.json':
+        # Load JSON config
+        with open(config_path, "r") as f:
+            return json.load(f)
+    elif config_path.suffix == '.py':
+        # Load Python config
+        import sys
+        import importlib.util
+        
+        spec = importlib.util.spec_from_file_location("config", config_path)
+        config_module = importlib.util.module_from_spec(spec)
+        sys.modules["config"] = config_module
+        spec.loader.exec_module(config_module)
+        
+        return config_module.get_config()
+    else:
+        raise ValueError(f"Unsupported config file format: {config_path.suffix}")
+
+
 def main(args: argparse.Namespace) -> None:
     # load experiment configurations
-    with open(args.config, "r") as f_json:
-        config = json.loads(f_json.read())
+    config = load_config(args.config)
     model_config = config["model_config"]
     optim_config = config["optim_config"]
     optim_config["epochs"] = config["num_epochs"]
@@ -162,6 +193,7 @@ def main(args: argparse.Namespace) -> None:
     # define database related paths
     output_dir = Path(args.output_dir)
     database_path = Path(config["database_path"])
+    feature_path = Path(config["feature_path"])
     
     # define model related paths
     model_tag = "{}_ep{}_bs{}".format(
@@ -171,7 +203,6 @@ def main(args: argparse.Namespace) -> None:
         model_tag = model_tag + "_{}".format(args.comment)
     model_tag = output_dir / model_tag
     model_save_path = model_tag / "weights"
-    eval_score_path = model_tag / config["eval_output"]
     writer = SummaryWriter(model_tag)
     os.makedirs(model_save_path, exist_ok=True)
     copy(args.config, model_tag / "config.conf")
@@ -186,7 +217,7 @@ def main(args: argparse.Namespace) -> None:
     model = get_model(model_config, device)
 
     # define dataloaders
-    trn_loader, dev_loader, dev_trial_path = get_loader(database_path, args.seed, config, args.test)
+    trn_loader, dev_loader, dev_trial_path = get_loader(database_path, feature_path, args.seed, config, args.test)
 
     # get optimizer and scheduler
     optim_config["steps_per_epoch"] = len(trn_loader)
@@ -237,7 +268,7 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASVspoof detection system (refactored)")
-    parser.add_argument("--config", dest="config", type=str, default="config/config.json", help="configuration file")
+    parser.add_argument("--config", dest="config", type=str, default="config/config.py", help="configuration file (.json or .py)")
     parser.add_argument("--output_dir", dest="output_dir", type=str, default="./results", help="output directory for results")
     parser.add_argument("--seed", type=int, default=1234, help="random seed (default: 1234)")
     parser.add_argument("--comment", type=str, default=None, help="comment to describe the saved model")

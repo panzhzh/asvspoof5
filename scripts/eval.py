@@ -46,24 +46,51 @@ def produce_evaluation_file(data_loader: DataLoader, model, device: torch.device
         for fn, sco, trl in zip(fname_list, score_list, trial_lines):
             fields = trl.strip().split()
             # TSV format: original_id file_id gender codec_type track original_speaker codec algorithm label -
-            original_id = fields[0]  # E_1607
-            file_id = fields[1]      # E_0009538969
-            label = fields[8] if len(fields) > 8 else "unknown"  # spoof/bonafide
-            
-            assert fn == file_id, f"File ID mismatch: {fn} != {file_id}"
-            fh.write("{} {} {} {}\n".format(original_id, file_id, sco, label))
+            if len(fields) >= 9:
+                original_id = fields[0]  # E_1607
+                file_id = fields[1]      # E_0009538969
+                label = fields[8]        # spoof/bonafide
+                assert fn == file_id, f"File ID mismatch: {fn} != {file_id}"
+                fh.write("{} {} {} {}\n".format(original_id, file_id, sco, label))
+            else:
+                # Fallback for shorter format
+                print(f"Warning: Unexpected line format: {trl.strip()}")
+                continue
     print("Scores saved to {}".format(save_path))
+
+
+def load_config(config_path: str) -> dict:
+    """Load configuration from either JSON or Python file"""
+    config_path = Path(config_path)
+    
+    if config_path.suffix == '.json':
+        # Load JSON config
+        with open(config_path, "r") as f:
+            return json.load(f)
+    elif config_path.suffix == '.py':
+        # Load Python config
+        import sys
+        import importlib.util
+        
+        spec = importlib.util.spec_from_file_location("config", config_path)
+        config_module = importlib.util.module_from_spec(spec)
+        sys.modules["config"] = config_module
+        spec.loader.exec_module(config_module)
+        
+        return config_module.get_config()
+    else:
+        raise ValueError(f"Unsupported config file format: {config_path.suffix}")
 
 
 def main(args: argparse.Namespace) -> None:
     # Load experiment configurations
-    with open(args.config, "r") as f_json:
-        config = json.loads(f_json.read())
+    config = load_config(args.config)
     model_config = config["model_config"]
     
     # Define database related paths
     database_path = Path(config["database_path"])
-    eval_database_path = database_path / "flac_E/"
+    feature_path = Path(config["feature_path"])
+    eval_feature_path = feature_path / "eval"
     eval_trial_path = database_path / "ASVspoof5.eval.track_1.tsv"
     
     # Set device
@@ -83,7 +110,7 @@ def main(args: argparse.Namespace) -> None:
     _, file_eval = genSpoof_list(dir_meta=eval_trial_path, is_train=False, is_eval=True)
     print("no. evaluation files:", len(file_eval))
     
-    eval_set = TestDataset(list_IDs=file_eval, base_dir=eval_database_path)
+    eval_set = TestDataset(list_IDs=file_eval, feature_dir=eval_feature_path)
     eval_loader = DataLoader(
         eval_set,
         batch_size=config.get("batch_size", 32),
@@ -105,7 +132,7 @@ def main(args: argparse.Namespace) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASVspoof5 evaluation script")
-    parser.add_argument("--config", type=str, required=True, help="path to config file")
+    parser.add_argument("--config", type=str, required=True, help="path to config file (.json or .py)")
     parser.add_argument("--model_path", type=str, required=True, help="path to trained model weights")
     parser.add_argument("--output", type=str, default="./eval_scores.txt", help="output path for evaluation scores")
     args = parser.parse_args()

@@ -293,11 +293,18 @@ class CONV(nn.Module):
     def get_filters(self):
         device = self.f1.device
         dtype = self.f1.dtype
+        # Ensure valid (positive and ordered) cutoff frequencies to avoid NaNs in sinc
+        # f1 >= 50 Hz, f2 > f1
         f1 = torch.abs(self.f1) + 50
         f2 = f1 + torch.abs(self.f2)
 
-        B1 = self.band_pass(self.f1)
-        B2 = self.band_pass(self.f2)
+        # Optionally clamp the upper cutoff to Nyquist - small margin
+        nyq = (self.sample_rate / 2.0) - 1.0
+        f1 = torch.clamp(f1, min=1.0, max=nyq)
+        f2 = torch.clamp(f2, min=2.0, max=nyq)
+
+        B1 = self.band_pass(f1)
+        B2 = self.band_pass(f2)
         filters = B2 - B1
         filters = filters.view(self.out_channels, 1, self.kernel_size)
         return filters.to(device=device, dtype=dtype)

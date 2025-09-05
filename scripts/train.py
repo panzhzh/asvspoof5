@@ -50,7 +50,8 @@ def get_loader(database_path: Path, seed: int, config: dict, test_mode: bool = F
     d_label_trn, file_train = genSpoof_list(dir_meta=trn_list_path, is_train=True, is_eval=False)
     if test_mode:
         file_train = file_train[:int(len(file_train) * 0.01)]
-        d_label_trn = {k: v for k, v in d_label_trn.items() if k in file_train}
+        file_train_set = set(file_train)
+        d_label_trn = {k: v for k, v in d_label_trn.items() if k in file_train_set}
     print("no. training files:", len(file_train))
 
     train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, base_dir=trn_database_path)

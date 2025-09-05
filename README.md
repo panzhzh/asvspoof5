@@ -34,4 +34,49 @@ Track 2
 ## Other tools
 
 Tool-score-fusion: a reference tool to fuse ASV and CM scores for track 2.
-# asvspoof5
+
+---
+
+# Enhanced Project Structure
+
+This repository includes an enhanced, clean implementation for anti-spoofing research:
+
+## Clean Project Structure
+
+```
+asvspoof5/
+├── src/                    # Source code
+│   ├── models/model.py    # Model implementation  
+│   ├── data/datasets.py   # Data handling
+│   └── utils/training_utils.py
+├── config/config.py       # Training configuration
+├── scripts/               # Executable scripts
+│   ├── train.py          # Main training script
+│   └── convert_protocols.py
+├── data/ASVspoof5/        # Dataset
+├── evaluation-package/    # Official evaluation metrics
+└── Baseline-AASIST/       # Original baseline (unchanged)
+```
+
+## Usage
+
+```bash
+# Training
+python scripts/train.py                    # Standard training
+python scripts/train.py --comment exp1     # With experiment name
+python scripts/train.py --eval            # Evaluation mode
+```
+
+## Key Features
+
+- **Clean Architecture**: Modular design without AASIST-specific naming
+- **Simple Configuration**: Single `config/config.py` file
+- **Official Evaluation**: Uses evaluation-package for metrics
+- **Optimized Performance**: 8 workers, memory pinning, TensorBoard logging
+
+## Data Format
+
+The project expects data in `data/ASVspoof5/` with:
+- `flac_T/`: Training audio (182,357 files)  
+- `flac_D/`: Development audio (142,134 files)
+- Protocol files: `ASVspoof5.train.metainfor.txt`, `ASVspoof5.dev.metainfor.txt`

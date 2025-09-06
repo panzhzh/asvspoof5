@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import warnings
+from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from shutil import copy
@@ -195,10 +196,11 @@ def main(args: argparse.Namespace) -> None:
     database_path = Path(config["database_path"])
     feature_path = Path(config["feature_path"])
     
-    # define model related paths
-    model_tag = "{}_ep{}_bs{}".format(
+    # define model related paths with timestamp
+    timestamp = datetime.now().strftime("%m%d_%H%M")
+    model_tag = "{}_ep{}_bs{}_{}".format(
         os.path.splitext(os.path.basename(args.config))[0],
-        config["num_epochs"], config["batch_size"])
+        config["num_epochs"], config["batch_size"], timestamp)
     if args.comment:
         model_tag = model_tag + "_{}".format(args.comment)
     model_tag = output_dir / model_tag

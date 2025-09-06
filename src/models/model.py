@@ -357,7 +357,8 @@ class Residual_block(nn.Module):
                                              stride=1)
         else:
             self.downsample = False
-        self.mp = nn.MaxPool2d((1, 3))
+        # Reduce time dimension moderately to preserve enough steps
+        self.mp = nn.MaxPool2d((1, 2))
 
     def forward(self, x):
         identity = x
@@ -387,6 +388,11 @@ class Model(nn.Module):
         pool_ratios = d_args["pool_ratios"]
         temperatures = d_args["temperatures"]
 
+        # Feature-native front-end (for [B,6,T,768] inputs)
+        self.layer_weights = nn.Parameter(torch.zeros(6))  # learnable fusion over 6 layers
+        self.adapter_proj = nn.Conv1d(in_channels=768, out_channels=filts[0], kernel_size=1, bias=False)
+
+        # Legacy waveform front-end (kept for backward compatibility with [B,L])
         self.conv_time = CONV(out_channels=filts[0],
                               kernel_size=d_args["first_conv"],
                               in_channels=1)
@@ -436,10 +442,35 @@ class Model(nn.Module):
         self.out_layer = nn.Linear(5 * gat_dims[1], 2)
 
     def forward(self, x, Freq_aug=False):
-        x = x.unsqueeze(1)
-        x = self.conv_time(x, mask=Freq_aug)
-        x = x.unsqueeze(dim=1)
-        x = F.max_pool2d(torch.abs(x), (3, 3))
+        """Supports two input modes:
+        - Feature-native: x [B, 6, T, 768]
+        - Legacy waveform-like: x [B, L]
+        """
+        if x.dim() == 4 and x.size(1) == 6 and x.size(-1) == 768:
+            # Feature-native path: fuse layers and project channels
+            B, L6, T, D = x.shape
+            w = torch.softmax(self.layer_weights, dim=0).view(1, L6, 1, 1)  # [1,6,1,1]
+            x = (x * w).sum(dim=1)  # [B, T, 768]
+            x = x.transpose(1, 2)   # [B, 768, T]
+            x = self.adapter_proj(x) # [B, F, T]
+
+            # Frequency masking augmentation
+            if Freq_aug and self.training:
+                with torch.no_grad():
+                    bsz, Fch, TT = x.size()
+                    for b in range(bsz):
+                        ridx = random.randint(0, Fch - 1)
+                        x[b, ridx, :] = 0
+
+            x = torch.abs(x).unsqueeze(1)  # [B,1,F,T]
+        else:
+            # Legacy path: expects [B, L]
+            x = x.unsqueeze(1)              # [B,1,L]
+            x = self.conv_time(x, mask=Freq_aug)
+            x = x.unsqueeze(dim=1)          # [B,1,F,T]
+
+        # Initial pooling: keep freq pooling at 3 (70->~23), time pooling at 2
+        x = F.max_pool2d(torch.abs(x), (3, 2))
         x = self.first_bn(x)
         x = self.selu(x)
 

@@ -6,6 +6,7 @@ Evaluation script for ASVspoof5 eval dataset
 import argparse
 import json
 import sys
+import subprocess
 from pathlib import Path
 from importlib import import_module
 
@@ -15,7 +16,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data import TestDataset, genSpoof_list
+from src.data import EvalDataset, genSpoof_list
 
 
 def get_model(model_config: dict, device: torch.device):
@@ -43,6 +44,7 @@ def produce_evaluation_file(data_loader: DataLoader, model, device: torch.device
         score_list.extend(batch_score.tolist())
 
     with open(save_path, "w") as fh:
+        fh.write("filename\tcm-score\tcm_label\n")  # Header
         for fn, sco, trl in zip(fname_list, score_list, trial_lines):
             fields = trl.strip().split()
             # TSV format: original_id file_id gender codec_type track original_speaker codec algorithm label -
@@ -51,7 +53,7 @@ def produce_evaluation_file(data_loader: DataLoader, model, device: torch.device
                 file_id = fields[1]      # E_0009538969
                 label = fields[8]        # spoof/bonafide
                 assert fn == file_id, f"File ID mismatch: {fn} != {file_id}"
-                fh.write("{} {} {} {}\n".format(original_id, file_id, sco, label))
+                fh.write("{}\t{}\t{}\n".format(file_id, sco, label))
             else:
                 # Fallback for shorter format
                 print(f"Warning: Unexpected line format: {trl.strip()}")
@@ -89,8 +91,6 @@ def main(args: argparse.Namespace) -> None:
     
     # Define database related paths
     database_path = Path(config["database_path"])
-    feature_path = Path(config["feature_path"])
-    eval_feature_path = feature_path / "eval"
     eval_trial_path = database_path / "ASVspoof5.eval.track_1.tsv"
     
     # Set device
@@ -107,10 +107,16 @@ def main(args: argparse.Namespace) -> None:
     model.eval()
     
     # Prepare evaluation dataset
-    _, file_eval = genSpoof_list(dir_meta=eval_trial_path, is_train=False, is_eval=True)
+    file_eval = genSpoof_list(dir_meta=eval_trial_path, is_train=False, is_eval=True)
+    if args.test:
+        file_eval = file_eval[:int(len(file_eval) * 0.01)]
     print("no. evaluation files:", len(file_eval))
     
-    eval_set = TestDataset(list_IDs=file_eval, feature_dir=eval_feature_path)
+    # Use real-time WavLM extraction
+    print("Using real-time WavLM extraction")
+    audio_dir = database_path / "flac_E"
+    eval_set = EvalDataset(list_IDs=file_eval, audio_dir=audio_dir)
+    
     eval_loader = DataLoader(
         eval_set,
         batch_size=config.get("batch_size", 32),
@@ -126,8 +132,35 @@ def main(args: argparse.Namespace) -> None:
     produce_evaluation_file(eval_loader, model, device, output_path, eval_trial_path)
     
     print(f"Evaluation completed! Results saved to: {output_path}")
-    print("You can now use the evaluation-package to calculate metrics:")
-    print(f"cd evaluation-package && python evaluation.py --mode t1 --score_cm {output_path} --key_cm ../data/ASVspoof5/ASVspoof5.eval.track_1.tsv")
+    
+    # Auto-run evaluation metrics
+    print("\nCalculating evaluation metrics...")
+    eval_package_dir = Path(__file__).resolve().parents[1] / "evaluation-package"
+    key_file = database_path / "ASVspoof5.eval.track_1.tsv"
+    
+    # Create temporary key file with header and matching samples
+    temp_key_file = output_path.parent / "temp_key.tsv"
+    with open(key_file, 'r') as f_in, open(temp_key_file, 'w') as f_out:
+        f_out.write("original_id\tfilename\tgender\tcodec_type\ttrack\toriginal_speaker\tcodec\talgorithm\tkey_label\textra\n")
+        eval_file_set = set(file_eval)
+        matched_count = 0
+        for line in f_in:
+            fields = line.strip().split()
+            if len(fields) >= 2 and fields[1] in eval_file_set:
+                f_out.write('\t'.join(fields) + '\n')
+                matched_count += 1
+    
+    print(f"Matched {matched_count} key entries out of {len(file_eval)} eval files")
+    
+    result = subprocess.run([
+        "python", "evaluation.py", "--m", "t1", 
+        "--cm", str(output_path.resolve()), 
+        "--cm_keys", str(temp_key_file.resolve())
+    ], cwd=eval_package_dir, capture_output=True, text=True)
+    
+    print("Evaluation metrics:")
+    print(result.stdout)
+    temp_key_file.unlink()
 
 
 if __name__ == "__main__":
@@ -135,5 +168,6 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, required=True, help="path to config file (.json or .py)")
     parser.add_argument("--model_path", type=str, required=True, help="path to trained model weights")
     parser.add_argument("--output", type=str, default="./eval_scores.txt", help="output path for evaluation scores")
+    parser.add_argument("--test", action="store_true", help="use only 1% of data for quick testing")
     args = parser.parse_args()
     main(args)

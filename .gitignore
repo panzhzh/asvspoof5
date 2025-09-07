@@ -256,3 +256,6 @@ Icon
 .directory
 .Trash-*
 .nfs*
+
+# Force include src/data directory (exclude from data/ ignore)
+!src/data/

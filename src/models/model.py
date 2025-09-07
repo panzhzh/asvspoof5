@@ -388,8 +388,8 @@ class Model(nn.Module):
         pool_ratios = d_args["pool_ratios"]
         temperatures = d_args["temperatures"]
 
-        # Feature-native front-end (for [B,6,T,768] inputs)
-        self.layer_weights = nn.Parameter(torch.zeros(6))  # learnable fusion over 6 layers
+        # Feature-native front-end (default assumes 6 layers, 768-dim; will adapt on first forward)
+        self.layer_weights = nn.Parameter(torch.zeros(6))  # learnable fusion over layers
         self.adapter_proj = nn.Conv1d(in_channels=768, out_channels=filts[0], kernel_size=1, bias=False)
 
         # Legacy waveform front-end (kept for backward compatibility with [B,L])
@@ -443,15 +443,21 @@ class Model(nn.Module):
 
     def forward(self, x, Freq_aug=False):
         """Supports two input modes:
-        - Feature-native: x [B, 6, T, 768]
+        - Feature-native: x [B, L, T, D]
         - Legacy waveform-like: x [B, L]
         """
-        if x.dim() == 4 and x.size(1) == 6 and x.size(-1) == 768:
+        if x.dim() == 4:
             # Feature-native path: fuse layers and project channels
             B, L6, T, D = x.shape
-            w = torch.softmax(self.layer_weights, dim=0).view(1, L6, 1, 1)  # [1,6,1,1]
-            x = (x * w).sum(dim=1)  # [B, T, 768]
-            x = x.transpose(1, 2)   # [B, 768, T]
+            # If input shape differs from initialization, adapt parameters
+            if self.layer_weights.numel() != L6:
+                self.layer_weights = nn.Parameter(torch.zeros(L6, device=x.device, dtype=x.dtype))
+            if self.adapter_proj.in_channels != D:
+                self.adapter_proj = nn.Conv1d(in_channels=D, out_channels=self.adapter_proj.out_channels, kernel_size=1, bias=False).to(x.device)
+
+            w = torch.softmax(self.layer_weights, dim=0).view(1, L6, 1, 1)  # [1,L,1,1]
+            x = (x * w).sum(dim=1)  # [B, T, D]
+            x = x.transpose(1, 2)   # [B, D, T]
             x = self.adapter_proj(x) # [B, F, T]
 
             # Frequency masking augmentation

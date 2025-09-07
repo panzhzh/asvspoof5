@@ -26,7 +26,7 @@ config = {
     # =============================================================================
     # Training Hyperparameters
     # =============================================================================
-    "batch_size": 24,
+    "batch_size": 128,
     "num_epochs": 20,
     "loss": "CCE",  # Cross-Entropy Loss
     "track": "LA",  # Logical Access track

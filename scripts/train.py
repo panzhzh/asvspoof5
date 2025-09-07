@@ -265,7 +265,41 @@ def main(args: argparse.Namespace) -> None:
     # define dataloaders
     trn_loader, dev_loader, dev_trial_path = get_loader(database_path, feature_path, args.seed, config, args.test)
 
-    # get optimizer and scheduler
+    # Warm-up adapt: run a quick forward pass before creating optimizer
+    # to ensure any shape-dependent parameters (e.g., layer fusion weights or
+    # input adapters) are initialized with the correct [L, D]. This prevents
+    # missing new parameters in the optimizer.
+    try:
+        model.eval()
+        target_frames = int(config["model_config"].get("target_frames", 512))
+        with torch.no_grad():
+            batch_list, _ = next(iter(trn_loader))
+
+            # GPU pad/crop like in training to form [B, L, T, D]
+            def gpu_time_pad_crop(batch_list_local, target_len, device_local, is_train=False):
+                processed = []
+                for x in batch_list_local:
+                    x = x.to(device_local, non_blocking=True)
+                    L, T, D = x.shape
+                    if T == target_len:
+                        processed.append(x)
+                    elif T > target_len:
+                        start = 0  # deterministic for warm-up
+                        processed.append(x[:, start:start + target_len, :])
+                    else:
+                        repeats = (target_len // T) + 1
+                        x_rep = x.repeat(1, repeats, 1)[:, :target_len, :]
+                        processed.append(x_rep)
+                return torch.stack(processed, dim=0)
+
+            warm_x = gpu_time_pad_crop(batch_list, target_frames, torch.device(device), is_train=False)
+            _ = model(warm_x, Freq_aug=False)
+            del warm_x
+    except StopIteration:
+        # Empty training loader in rare cases; skip warm-up
+        pass
+
+    # get optimizer and scheduler (after warm-up so new params are included)
     optim_config["steps_per_epoch"] = len(trn_loader)
     optimizer, scheduler = create_optimizer(model.parameters(), optim_config)
     optimizer_swa = SWA(optimizer)

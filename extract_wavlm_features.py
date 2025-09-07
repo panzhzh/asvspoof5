@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 WavLM Feature Extraction with Ragged Memmap Storage
-Extracts L1–L8 features from microsoft/wavlm-base, applies PCA to 256 dims,
+Extracts L1–L8 features from microsoft/wavlm-base, applies PCA to 320 dims,
 and stores in space-efficient ragged memmap format (train/dev only).
 """
 
@@ -138,7 +138,7 @@ def fit_pca_models(data_root: Path,
                    max_files: int = 2000,
                    samples_per_file: int = 200,
                    test_mode: bool = False) -> Path:
-    """Fit per-layer IncrementalPCA (8 layers, 768→256) on sampled frames and save to NPZ.
+    """Fit per-layer IncrementalPCA (8 layers, 768→320) on sampled frames and save to NPZ.
 
     Returns the path to the saved PCA NPZ file.
     """
@@ -217,7 +217,7 @@ def fit_pca_models(data_root: Path,
     npz_data = {}
     for l in range(8):
         npz_data[f"mean_{l}"] = ipc_list[l].mean_.astype(np.float32)
-        npz_data[f"components_{l}"] = ipc_list[l].components_.astype(np.float32)  # [256,768]
+        npz_data[f"components_{l}"] = ipc_list[l].components_.astype(np.float32)  # [320,768]
         # Save and print cumulative explained variance ratio for verification
         evr_cum = ipc_list[l].explained_variance_ratio_.cumsum().astype(np.float32)
         npz_data[f"evr_{l}"] = evr_cum
@@ -309,7 +309,7 @@ def load_existing_lengths(lengths_file):
 
 def pass2_extract_and_store_ragged(data_root, length_records, test_mode=False, target_splits=None,
                                    pca_npz: Path = None):
-    """Pass 2: Extract features, apply PCA(256) per layer, and store ragged memmap (CSR-style)"""
+    """Pass 2: Extract features, apply PCA(320) per layer, and store ragged memmap (CSR-style)"""
     
     if target_splits is None:
         target_splits = ['train', 'dev']
@@ -326,7 +326,7 @@ def pass2_extract_and_store_ragged(data_root, length_records, test_mode=False, t
         pca_npz = fit_pca_models(data_root, model, processor, target_splits=['train'], test_mode=test_mode)
     pca_data = np.load(pca_npz)
     means = [pca_data[f"mean_{l}"] for l in range(8)]            # (768,)
-    comps = [pca_data[f"components_{l}"] for l in range(8)]      # (256,768)
+    comps = [pca_data[f"components_{l}"] for l in range(8)]      # (320,768)
     feature_root = data_root / "features"
     
     all_splits = {
@@ -410,7 +410,7 @@ def pass2_extract_and_store_ragged(data_root, length_records, test_mode=False, t
             audio_path = audio_dir / f"{utt_id}.flac"
             
             try:
-                # Extract L1–L8 features and apply PCA to 256 dims per layer
+                # Extract L1–L8 features and apply PCA to 320 dims per layer
                 features = extract_wavlm_features(audio_path, model, processor)  # [8, T, 768]
                 real_len = features.shape[1]
 
@@ -418,14 +418,14 @@ def pass2_extract_and_store_ragged(data_root, length_records, test_mode=False, t
                 for l in range(8):
                     X = features[l].astype(np.float32)  # [T,768]
                     Xc = X - means[l]
-                    Y = Xc @ comps[l].T  # [T,256]
+                    Y = Xc @ comps[l].T  # [T,320]
                     proj_layers.append(Y.astype(np.float16))
                     del X, Xc, Y
                 del features
-                proj = np.stack(proj_layers, axis=0)  # [8,T,256]
+                proj = np.stack(proj_layers, axis=0)  # [8,T,320]
 
                 # Flatten for shard storage
-                flat_features = proj.ravel()  # [8*T*256]
+                flat_features = proj.ravel()  # [8*T*320]
                 elem_count = flat_features.size
                 
                 # Check if we need a new shard
@@ -446,7 +446,7 @@ def pass2_extract_and_store_ragged(data_root, length_records, test_mode=False, t
                     "elem_count": elem_count,
                     "real_len": real_len,
                     "L": 8,  # number of layers
-                    "D": 256,  # PCA-projected feature dimension
+                    "D": 320,  # PCA-projected feature dimension
                     "dtype": str(DTYPE).split('.')[-1],  # "float16"
                     "layers": [1, 2, 3, 4, 5, 6, 7, 8],
                     "model": "microsoft/wavlm-base",
@@ -508,7 +508,7 @@ def pass2_extract_and_store_ragged(data_root, length_records, test_mode=False, t
         total_elems = sum(r["elem_count"] for r in index_records)
         total_gb = total_elems * BYTES_PER_ELEM / (1024**3)
         print(f"{split} complete: {len(index_records):,} samples, {total_gb:.2f}GB total ({current_shard_id + 1} shards)")
-        print(f"Average length: {total_elems / len(index_records) / (8 * 256):.1f} frames")
+        print(f"Average length: {total_elems / len(index_records) / (8 * 320):.1f} frames")
         
         # Random sample verification (quick self-check)
         if len(index_records) > 0:
@@ -549,7 +549,7 @@ def verify_random_samples(split_dir, sample_records):
     print("Self-check complete.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract WavLM features (train/dev) with PCA(256) and ragged memmap storage")
+    parser = argparse.ArgumentParser(description="Extract WavLM features (train/dev) with PCA(320) and ragged memmap storage")
     parser.add_argument("--test", action="store_true", help="Use only 1% of data for testing")
     parser.add_argument("--dev", action="store_true", help="Extract only dev dataset features")
     parser.add_argument("--train", action="store_true", help="Extract only train dataset features")

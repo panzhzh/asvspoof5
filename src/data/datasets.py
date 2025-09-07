@@ -148,13 +148,14 @@ class FeatureLoader:
 class TrainDataset(Dataset):
     """Training dataset using pre-extracted WavLM features.
 
-    Returns a FloatTensor of shape [6, T, 768] where T == target_frames.
+    Returns a FloatTensor of shape [L, T, D] (no time pad/crop here).
+    Time pad/crop will be performed on GPU in the training loop.
     """
     def __init__(self, list_IDs, labels, feature_dir, target_frames: int = 512):
         self.list_IDs = list_IDs
         self.labels = labels
         self.feature_loader = FeatureLoader(feature_dir)
-        self.target_frames = int(target_frames)
+        self.target_frames = int(target_frames)  # kept for reference; not applied here
 
     def __len__(self):
         return len(self.list_IDs)
@@ -181,12 +182,9 @@ class TrainDataset(Dataset):
     def __getitem__(self, index):
         key = self.list_IDs[index]
         
-        # Load pre-extracted features [6, real_len, 768]
+        # Load pre-extracted features [L, real_len, D]; no pad/crop here
         features = self.feature_loader.get_features(key)
-        features = self._pad_or_crop_layers(features, self.target_frames)  # [6, T, 768]
-
-        # Convert to tensor
-        # Copy into a writable CPU tensor to avoid from_numpy on readonly memmap views
+        # Convert to tensor (writable)
         x_inp = torch.tensor(features, dtype=torch.float32)
         y = self.labels[key]
         return x_inp, y

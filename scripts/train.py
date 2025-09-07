@@ -17,6 +17,8 @@ from shutil import copy
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 from torchcontrib.optim import SWA
 from tqdm import tqdm
@@ -55,9 +57,17 @@ def get_loader(database_path: Path, feature_path: Path, seed: int, config: dict,
         d_label_trn = {k: v for k, v in d_label_trn.items() if k in file_train_set}
     print("no. training files:", len(file_train))
 
-    train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, feature_dir=trn_feature_path)
+    target_frames = int(config["model_config"].get("target_frames", 512))
+    train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, feature_dir=trn_feature_path, target_frames=target_frames)
     gen = torch.Generator()
     gen.manual_seed(seed)
+    # Variable-length collate for training (returns list of tensors)
+    def collate_varlen_train(batch):
+        feats, labels = zip(*batch)
+        return list(feats), torch.tensor(labels, dtype=torch.long)
+
+    # DataLoader performance knobs
+    num_workers = min(max(os.cpu_count() // 2, 4), 8)
     trn_loader = DataLoader(
         train_set,
         batch_size=config["batch_size"],
@@ -66,6 +76,10 @@ def get_loader(database_path: Path, feature_path: Path, seed: int, config: dict,
         pin_memory=True,
         worker_init_fn=seed_worker,
         generator=gen,
+        collate_fn=collate_varlen_train,
+        num_workers=num_workers,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     _, file_dev = genSpoof_list(dir_meta=dev_trial_path, is_train=False, is_eval=False)
@@ -75,13 +89,16 @@ def get_loader(database_path: Path, feature_path: Path, seed: int, config: dict,
         file_dev = file_dev[:2000]
     print("no. validation files:", len(file_dev))
 
-    dev_set = TestDataset(list_IDs=file_dev, feature_dir=dev_feature_path)
+    dev_set = TestDataset(list_IDs=file_dev, feature_dir=dev_feature_path, target_frames=target_frames)
     dev_loader = DataLoader(
         dev_set,
         batch_size=config["batch_size"],
         shuffle=False,
         drop_last=False,
         pin_memory=True,
+        num_workers=num_workers,
+        persistent_workers=True,
+        prefetch_factor=2,
     )
 
     return trn_loader, dev_loader, dev_trial_path
@@ -95,9 +112,10 @@ def produce_evaluation_file(data_loader: DataLoader, model, device: torch.device
     fname_list = []
     score_list = []
     for batch_x, utt_id in tqdm(data_loader):
-        batch_x = batch_x.to(device)
+        batch_x = batch_x.to(device, non_blocking=True)
         with torch.no_grad():
-            _, batch_out = model(batch_x)
+            with autocast():
+                _, batch_out = model(batch_x)
             batch_score = (batch_out[:, 1]).data.cpu().numpy().ravel()
         fname_list.extend(utt_id)
         score_list.extend(batch_score.tolist())
@@ -131,17 +149,43 @@ def train_epoch(trn_loader: DataLoader,
 
     weight = torch.FloatTensor([0.1, 0.9]).to(device)
     criterion = nn.CrossEntropyLoss(weight=weight)
-    for batch_x, batch_y in tqdm(trn_loader):
-        batch_size = batch_x.size(0)
+
+    target_frames = int(config["model_config"].get("target_frames", 512))
+    scaler = GradScaler()
+
+    def gpu_time_pad_crop(batch_list, target_len, device, is_train=True):
+        processed = []
+        for x in batch_list:
+            # x: [L, T, D] on CPU
+            x = x.to(device, non_blocking=True)
+            L, T, D = x.shape
+            if T == target_len:
+                processed.append(x)
+            elif T > target_len:
+                start = torch.randint(0, T - target_len + 1, (1,), device=device).item() if is_train else 0
+                processed.append(x[:, start:start + target_len, :])
+            else:
+                # repeat-pad along time on GPU
+                repeats = (target_len // T) + 1
+                x_rep = x.repeat(1, repeats, 1)[:, :target_len, :]
+                processed.append(x_rep)
+        return torch.stack(processed, dim=0)  # [B, L, target_len, D]
+
+    for batch_list, batch_y in tqdm(trn_loader):
+        batch_size = len(batch_list)
         num_total += batch_size
-        batch_x = batch_x.to(device)
-        batch_y = batch_y.view(-1).type(torch.int64).to(device)
-        _, batch_out = model(batch_x, Freq_aug=str_to_bool(config["freq_aug"]))
-        batch_loss = criterion(batch_out, batch_y)
+
+        batch_x = gpu_time_pad_crop(batch_list, target_frames, device, is_train=True)
+        batch_y = batch_y.view(-1).type(torch.int64).to(device, non_blocking=True)
+
+        with autocast():
+            _, batch_out = model(batch_x, Freq_aug=str_to_bool(config["freq_aug"]))
+            batch_loss = criterion(batch_out, batch_y)
         running_loss += batch_loss.item() * batch_size
         optim.zero_grad()
-        batch_loss.backward()
-        optim.step()
+        scaler.scale(batch_loss).backward()
+        scaler.step(optim)
+        scaler.update()
 
         if config["optim_config"]["scheduler"] in ["cosine", "keras_decay"]:
             scheduler.step()
@@ -277,4 +321,3 @@ if __name__ == "__main__":
     parser.add_argument("--test", action="store_true", help="use only 1% of data for quick testing")
     args = parser.parse_args()
     main(args)
-

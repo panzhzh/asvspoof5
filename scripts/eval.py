@@ -117,12 +117,16 @@ def main(args: argparse.Namespace) -> None:
     audio_dir = database_path / "flac_E"
     eval_set = EvalDataset(list_IDs=file_eval, audio_dir=audio_dir)
     
+    bs_test = int(config.get("batch_size_test", 32))
+    nw_test = int(config.get("num_workers_test", 0))
     eval_loader = DataLoader(
         eval_set,
-        batch_size=config.get("batch_size", 32),
+        batch_size=bs_test,
         shuffle=False,
         drop_last=False,
         pin_memory=True,
+        num_workers=nw_test,
+        persistent_workers=False,
     )
     
     # Perform evaluation

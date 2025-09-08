@@ -88,6 +88,24 @@ class FeatureLoader:
         if shard_name not in self.shard_data:
             shard_file = self.feature_dir / shard_name
             self.shard_data[shard_name] = np.lib.format.open_memmap(shard_file, mode='r')
+
+    def get_shard_memmap(self, shard_name):
+        """Return memmap handle for a shard (loads on first access)"""
+        self._load_shard(shard_name)
+        return self.shard_data[shard_name]
+
+    @staticmethod
+    def bytes_per_elem_from_dtype(dtype_str: str | None) -> int:
+        if not dtype_str:
+            return 2
+        ds = dtype_str.lower()
+        if '16' in ds:
+            return 2
+        if '32' in ds:
+            return 4
+        if '64' in ds:
+            return 8
+        return 2
     
     def _load_bucket(self, bucket_size):
         """Load bucket data if not already loaded (bucketed format)"""
@@ -151,11 +169,12 @@ class TrainDataset(Dataset):
     Returns a FloatTensor of shape [L, T, D] (no time pad/crop here).
     Time pad/crop will be performed on GPU in the training loop.
     """
-    def __init__(self, list_IDs, labels, feature_dir, target_frames: int = 512):
+    def __init__(self, list_IDs, labels, feature_dir, target_frames: int = 512, return_pointer: bool = False):
         self.list_IDs = list_IDs
         self.labels = labels
         self.feature_loader = FeatureLoader(feature_dir)
         self.target_frames = int(target_frames)  # kept for reference; not applied here
+        self.return_pointer = bool(return_pointer)
 
     def __len__(self):
         return len(self.list_IDs)
@@ -182,12 +201,29 @@ class TrainDataset(Dataset):
     def __getitem__(self, index):
         key = self.list_IDs[index]
         
-        # Load pre-extracted features [L, real_len, D]; no pad/crop here
-        features = self.feature_loader.get_features(key)
-        # Convert to tensor (writable)
-        x_inp = torch.tensor(features, dtype=torch.float32)
-        y = self.labels[key]
-        return x_inp, y
+        if self.return_pointer and self.feature_loader.format_type == 'ragged_memmap':
+            # Return pointer metadata for batch-aggregated I/O
+            record = self.feature_loader.file_to_record[key]
+            ptr = {
+                'utt_id': key,
+                'shard': record['shard'],
+                'offset_elems': int(record['offset_elems']),
+                'elem_count': int(record['elem_count']),
+                'L': int(record['L']),
+                'D': int(record.get('D', 288)),
+                'real_len': int(record['real_len']),
+                'dtype': record.get('dtype', 'float16'),
+                'ds_idx': int(index),
+            }
+            y = self.labels[key]
+            return ptr, y
+        else:
+            # Load pre-extracted features [L, real_len, D]; no pad/crop here
+            features = self.feature_loader.get_features(key)
+            # Convert to tensor (writable)
+            x_inp = torch.tensor(features, dtype=torch.float32)
+            y = self.labels[key]
+            return x_inp, y
 
 
 class TestDataset(Dataset):

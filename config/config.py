@@ -26,7 +26,10 @@ config = {
     # =============================================================================
     # Training Hyperparameters
     # =============================================================================
-    "batch_size": 128,
+    # Batch sizes: train/dev/test separated (fallbacks provided in code)
+    "batch_size_train": 128,
+    "batch_size_dev": 32,
+    "batch_size_test": 32,
     "num_epochs": 20,
     "loss": "CCE",  # Cross-Entropy Loss
     "track": "LA",  # Logical Access track
@@ -34,11 +37,27 @@ config = {
     # Evaluation settings
     "eval_all_best": True,
     "eval_output": "eval_scores_using_best_dev_model.txt",
-    
+
     # PyTorch settings for reproducibility and performance
     "cudnn_deterministic_toggle": True,
     "cudnn_benchmark_toggle": True,
-    
+
+    # DataLoader worker settings (tune for throughput vs. stability)
+    "num_workers_train": 0,
+    "num_workers_dev": 0,
+    "num_workers_test": 0,
+
+    # I/O optimization (ragged memmap): block-wise sequential read with per-epoch block shuffle
+    "io_block_shuffle": True,
+    "io_block_mb": 512,
+
+    # I/O cropping on load: read only needed time window (training)
+    # If True, collate reads first `target_frames` frames directly from disk (per sample)
+    # to reduce disk traffic. Set False to read full sample then crop on GPU.
+    "io_crop_on_load": True,
+    # Limit number of layers to read on training (e.g., 6 to save I/O). None -> read all.
+    "io_train_layers": None,
+
     # Data augmentation
     "freq_aug": False,  # Frequency masking augmentation
     

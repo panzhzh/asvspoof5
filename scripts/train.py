@@ -9,12 +9,14 @@ import json
 import os
 import sys
 import warnings
+import gc
 from datetime import datetime
 from importlib import import_module
 from pathlib import Path
 from shutil import copy
 
 import torch
+import numpy as np
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
@@ -26,6 +28,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data import TrainDataset, TestDataset, genSpoof_list
+from src.data.samplers import BlockBatchSampler
 from src.eval import calculate_minDCF_EER_CLLR, calculate_aDCF_tdcf_tEER
 from src.utils import create_optimizer, seed_worker, set_seed, str_to_bool
 
@@ -42,8 +45,13 @@ def get_model(model_config: dict, device: torch.device):
     return model
 
 
-def get_loader(database_path: Path, feature_path: Path, seed: int, config: dict, test_mode: bool = False):
-    """Make PyTorch DataLoaders for train / development using pre-extracted features"""
+def get_loader(database_path: Path,
+               feature_path: Path,
+               seed: int,
+               config: dict,
+               test_mode: bool = False,
+               dev_limit: int | None = None):
+    """Create training DataLoader and a builder for dev DataLoader (on-demand)."""
     trn_feature_path = feature_path / "train"
     dev_feature_path = feature_path / "dev"
 
@@ -58,7 +66,17 @@ def get_loader(database_path: Path, feature_path: Path, seed: int, config: dict,
     print("no. training files:", len(file_train))
 
     target_frames = int(config["model_config"].get("target_frames", 512))
-    train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, feature_dir=trn_feature_path, target_frames=target_frames)
+    bs_train = int(config.get("batch_size_train", config.get("batch_size", 128)))
+    bs_dev = int(config.get("batch_size_dev", 32))
+    nw_train = int(config.get("num_workers_train", 4))
+    nw_dev = int(config.get("num_workers_dev", 0))
+    io_block_shuffle = bool(config.get("io_block_shuffle", False))
+    io_block_mb = int(config.get("io_block_mb", 512))
+    io_crop_on_load = bool(config.get("io_crop_on_load", False))
+    io_train_layers = config.get("io_train_layers", None)
+    # When using ragged_memmap + block shuffle, return pointer to enable batch-level aggregated I/O
+    return_pointer = bool(io_block_shuffle)
+    train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, feature_dir=trn_feature_path, target_frames=target_frames, return_pointer=return_pointer)
     gen = torch.Generator()
     gen.manual_seed(seed)
     # Variable-length collate for training (returns list of tensors)
@@ -66,42 +84,188 @@ def get_loader(database_path: Path, feature_path: Path, seed: int, config: dict,
         feats, labels = zip(*batch)
         return list(feats), torch.tensor(labels, dtype=torch.long)
 
-    # DataLoader performance knobs
-    num_workers = min(max(os.cpu_count() // 2, 4), 8)
-    trn_loader = DataLoader(
-        train_set,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        drop_last=True,
-        pin_memory=True,
-        worker_init_fn=seed_worker,
-        generator=gen,
-        collate_fn=collate_varlen_train,
-        num_workers=num_workers,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
+    # Build block-wise batch sampler for near-sequential disk access (ragged_memmap only)
+    if io_block_shuffle and getattr(train_set.feature_loader, "format_type", None) == "ragged_memmap":
+        # Build per-shard, offset-sorted index blocks and batch sampler
+        file_to_record = train_set.feature_loader.file_to_record
+        # bytes per element from dtype (default float16 -> 2)
+        def bytes_per_elem(dtype_str: str | None) -> int:
+            if not dtype_str:
+                return 2
+            ds = dtype_str.lower()
+            if "16" in ds:
+                return 2
+            if "32" in ds:
+                return 4
+            if "64" in ds:
+                return 8
+            return 2
 
+        # Collect records keyed by shard
+        per_shard = {}
+        for ds_idx, utt_id in enumerate(file_train):
+            rec = file_to_record[utt_id]
+            shard = rec["shard"]
+            off = int(rec["offset_elems"])
+            cnt = int(rec["elem_count"])
+            bpe = bytes_per_elem(rec.get("dtype"))
+            size_bytes = cnt * bpe
+            per_shard.setdefault(shard, []).append((off, ds_idx, size_bytes))
+
+        # Build blocks within each shard
+        block_bytes_limit = max(1, io_block_mb) * 1024 * 1024
+        index_blocks: list[list[int]] = []
+        # Map dataset index -> covering block contiguous byte range for its shard
+        dsidx_to_blockrange: dict[int, tuple[int, int, str]] = {}
+        for shard, items in per_shard.items():
+            items.sort(key=lambda x: x[0])  # by offset
+            cur_items: list[tuple[int, int, int]] = []  # (off, ds_idx, sz)
+            acc = 0
+            for off, ds_idx, sz in items:
+                if acc > 0 and acc + sz > block_bytes_limit:
+                    # finalize current block and index mapping
+                    blk_start = cur_items[0][0]
+                    blk_end = cur_items[-1][0] + cur_items[-1][2]
+                    index_blocks.append([ds for (_o, ds, _s) in cur_items])
+                    for _off, _ds, _sz in cur_items:
+                        dsidx_to_blockrange[_ds] = (blk_start, blk_end, shard)
+                    # reset
+                    cur_items = []
+                    acc = 0
+                cur_items.append((off, ds_idx, sz))
+                acc += sz
+            if cur_items:
+                blk_start = cur_items[0][0]
+                blk_end = cur_items[-1][0] + cur_items[-1][2]
+                index_blocks.append([ds for (_o, ds, _s) in cur_items])
+                for _off, _ds, _sz in cur_items:
+                    dsidx_to_blockrange[_ds] = (blk_start, blk_end, shard)
+
+        batch_sampler = BlockBatchSampler(index_blocks=index_blocks,
+                                          batch_size=bs_train,
+                                          drop_last=True,
+                                          seed=seed)
+
+        # Aggregated I/O collate: read contiguous block(s) per shard for current batch
+        # Simple per-shard block cache to reuse contiguous reads across consecutive batches
+        block_cache: dict[tuple[str, int, int], dict[str, object]] = {}
+
+        def collate_varlen_train_batchio(batch):
+            # batch: list of (ptr, label)
+            # group by shard
+            by_shard = {}
+            for ptr, y in batch:
+                by_shard.setdefault(ptr['shard'], []).append((ptr, y))
+            out_feats = []
+            out_labels = []
+            for shard, items in by_shard.items():
+                # sort by offset within shard
+                items.sort(key=lambda t: t[0]['offset_elems'])
+                mm = train_set.feature_loader.get_shard_memmap(shard)
+                if not io_crop_on_load:
+                    # Read full sample ranges as one contiguous block per shard group
+                    # Compute enclosing block range from precomputed map (use first item's ds_idx)
+                    blk_meta = dsidx_to_blockrange.get(int(items[0][0]['ds_idx']))
+                    if blk_meta is None:
+                        # fallback to per-batch union
+                        start = items[0][0]['offset_elems']
+                        end = max(t[0]['offset_elems'] + t[0]['elem_count'] for t in items)
+                        cache_key = (shard, start, end)
+                    else:
+                        start, end, _sh = blk_meta
+                        cache_key = (shard, start, end)
+                    entry = block_cache.get(cache_key)
+                    if entry is None:
+                        flat = mm[start:end]
+                        flat_np = np.array(flat, copy=True)
+                        block_cache.clear()  # keep only one block to bound memory
+                        block_cache[cache_key] = {'array': flat_np}
+                    else:
+                        flat_np = entry['array']  # type: ignore[assignment]
+                    for p, y in items:
+                        s = p['offset_elems'] - start
+                        e = s + p['elem_count']
+                        arr = flat_np[s:e]
+                        L, T, D = p['L'], p['real_len'], p['D']
+                        arr = arr.reshape(L, T, D)
+                        out_feats.append(torch.tensor(arr, dtype=torch.float32))
+                        out_labels.append(y)
+                    # Keep flat_np in cache for potential reuse in next batch
+                else:
+                    # Read only first target_frames frames (per sample) and optional layer subset
+                    tf = target_frames
+                    for p, y in items:
+                        L_total, T_total, D = p['L'], p['real_len'], p['D']
+                        L_read = int(L_total if io_train_layers in (None, 'None') else min(L_total, int(io_train_layers)))
+                        T_read = min(T_total, tf)
+                        # Allocate output array
+                        arr = np.empty((L_read, T_read, D), dtype=mm.dtype)
+                        base = p['offset_elems']
+                        stride_layer = T_total * D
+                        seg_elems = T_read * D
+                        # Read per-layer contiguous segment
+                        for l in range(L_read):
+                            seg_start = base + l * stride_layer
+                            seg = mm[seg_start: seg_start + seg_elems]
+                            # materialize to ndarray and reshape to [T_read, D]
+                            seg_np = np.array(seg, copy=True).reshape(T_read, D)
+                            arr[l] = seg_np
+                        out_feats.append(torch.tensor(arr, dtype=torch.float32))
+                        out_labels.append(y)
+            return out_feats, torch.tensor(out_labels, dtype=torch.long)
+
+        trn_loader = DataLoader(
+            dataset=train_set,
+            batch_sampler=batch_sampler,
+            pin_memory=True,
+            worker_init_fn=seed_worker if nw_train > 0 else None,
+            collate_fn=collate_varlen_train_batchio,
+            num_workers=nw_train,
+            persistent_workers=True if nw_train > 0 else False,
+        )
+    else:
+        # Fallback: regular random shuffle
+        trn_kwargs = dict(
+            dataset=train_set,
+            batch_size=bs_train,
+            shuffle=True,
+            drop_last=True,
+            pin_memory=True,
+            worker_init_fn=seed_worker,
+            generator=gen,
+            collate_fn=collate_varlen_train,
+            num_workers=nw_train,
+            persistent_workers=True if nw_train > 0 else False,
+        )
+        if nw_train > 0:
+            trn_kwargs["prefetch_factor"] = 2
+        trn_loader = DataLoader(**trn_kwargs)
+
+    # Prepare dev file list now; actual DataLoader built on-demand each epoch
     _, file_dev = genSpoof_list(dir_meta=dev_trial_path, is_train=False, is_eval=False)
     if test_mode:
         file_dev = file_dev[:int(len(file_dev) * 0.01)]
-    else:
-        file_dev = file_dev[:2000]
+    elif dev_limit is not None and dev_limit > 0:
+        file_dev = file_dev[:dev_limit]
     print("no. validation files:", len(file_dev))
 
-    dev_set = TestDataset(list_IDs=file_dev, feature_dir=dev_feature_path, target_frames=target_frames)
-    dev_loader = DataLoader(
-        dev_set,
-        batch_size=config["batch_size"],
-        shuffle=False,
-        drop_last=False,
-        pin_memory=True,
-        num_workers=num_workers,
-        persistent_workers=True,
-        prefetch_factor=2,
-    )
+    def build_dev_loader():
+        dev_set_local = TestDataset(list_IDs=file_dev, feature_dir=dev_feature_path, target_frames=target_frames)
+        # dev loader: configurable batch size; typically num_workers=0; non-persistent
+        dev_kwargs = dict(
+            dataset=dev_set_local,
+            batch_size=bs_dev,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=True,
+            num_workers=nw_dev,
+            persistent_workers=False,
+        )
+        if nw_dev > 0:
+            dev_kwargs["prefetch_factor"] = 2
+        return DataLoader(**dev_kwargs)
 
-    return trn_loader, dev_loader, dev_trial_path
+    return trn_loader, build_dev_loader, dev_trial_path
 
 
 def produce_evaluation_file(data_loader: DataLoader, model, device: torch.device, save_path: Path, trial_path: Path) -> None:
@@ -142,7 +306,8 @@ def train_epoch(trn_loader: DataLoader,
                 optim: torch.optim.Optimizer,
                 device: torch.device,
                 scheduler,
-                config: dict):
+                config: dict,
+                epoch: int):
     running_loss = 0
     num_total = 0.0
     model.train()
@@ -170,6 +335,14 @@ def train_epoch(trn_loader: DataLoader,
                 x_rep = x.repeat(1, repeats, 1)[:, :target_len, :]
                 processed.append(x_rep)
         return torch.stack(processed, dim=0)  # [B, L, target_len, D]
+
+    # Set epoch on custom batch sampler if available (enables block shuffle per-epoch)
+    try:
+        bs = getattr(trn_loader, "batch_sampler", None)
+        if hasattr(bs, "set_epoch"):
+            bs.set_epoch(epoch)
+    except Exception:
+        pass
 
     for batch_list, batch_y in tqdm(trn_loader):
         batch_size = len(batch_list)
@@ -242,9 +415,10 @@ def main(args: argparse.Namespace) -> None:
     
     # define model related paths with timestamp
     timestamp = datetime.now().strftime("%m%d_%H%M")
+    bs_train = int(config.get("batch_size_train", config.get("batch_size", 128)))
     model_tag = "{}_ep{}_bs{}_{}".format(
         os.path.splitext(os.path.basename(args.config))[0],
-        config["num_epochs"], config["batch_size"], timestamp)
+        config["num_epochs"], bs_train, timestamp)
     if args.comment:
         model_tag = model_tag + "_{}".format(args.comment)
     model_tag = output_dir / model_tag
@@ -263,7 +437,14 @@ def main(args: argparse.Namespace) -> None:
     model = get_model(model_config, device)
 
     # define dataloaders
-    trn_loader, dev_loader, dev_trial_path = get_loader(database_path, feature_path, args.seed, config, args.test)
+    trn_loader, build_dev_loader, dev_trial_path = get_loader(
+        database_path,
+        feature_path,
+        args.seed,
+        config,
+        args.test,
+        args.dev_limit,
+    )
 
     # Warm-up adapt: run a quick forward pass before creating optimizer
     # to ensure any shape-dependent parameters (e.g., layer fusion weights or
@@ -273,6 +454,13 @@ def main(args: argparse.Namespace) -> None:
         model.eval()
         target_frames = int(config["model_config"].get("target_frames", 512))
         with torch.no_grad():
+            # Ensure deterministic block order for warm-up
+            try:
+                bs = getattr(trn_loader, "batch_sampler", None)
+                if hasattr(bs, "set_epoch"):
+                    bs.set_epoch(0)
+            except Exception:
+                pass
             batch_list, _ = next(iter(trn_loader))
 
             # GPU pad/crop like in training to form [B, L, T, D]
@@ -317,9 +505,13 @@ def main(args: argparse.Namespace) -> None:
     for epoch in range(config["num_epochs"]):
         print("training epoch{:03d}".format(epoch))
 
-        running_loss = train_epoch(trn_loader, model, optimizer, device, scheduler, config)
+        running_loss = train_epoch(trn_loader, model, optimizer, device, scheduler, config, epoch)
 
+        # Build fresh dev loader each epoch, evaluate, then release
+        dev_loader = build_dev_loader()
         produce_evaluation_file(dev_loader, model, device, metric_path/"dev_score.txt", dev_trial_path)
+        del dev_loader
+        gc.collect()
         dev_dcf, dev_eer, dev_cllr = calculate_minDCF_EER_CLLR(
             cm_scores_file=metric_path/"dev_score.txt",
             output_file=metric_path/"dev_DCF_EER_{}epo.txt".format(epoch),
@@ -353,5 +545,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=1234, help="random seed (default: 1234)")
     parser.add_argument("--comment", type=str, default=None, help="comment to describe the saved model")
     parser.add_argument("--test", action="store_true", help="use only 1% of data for quick testing")
+    parser.add_argument("--dev-limit", dest="dev_limit", type=int, default=None,
+                        help="limit number of dev samples (default: None = use full dev)")
     args = parser.parse_args()
     main(args)

@@ -150,7 +150,8 @@ def fit_pca_models(data_root: Path,
     # Prepare file lists for train/dev
     all_splits = {
         'train': (data_root / 'ASVspoof5.train.tsv', data_root / "flac_T/"),
-        'dev': (data_root / 'ASVspoof5.dev.track_1.tsv', data_root / "flac_D/")
+        'dev': (data_root / 'ASVspoof5.dev.track_1.tsv', data_root / "flac_D/"),
+        'eval': (data_root / 'ASVspoof5.eval.track_1.tsv', data_root / "flac_E/")
     }
     if target_splits is None:
         target_splits = ['train']
@@ -262,7 +263,8 @@ def pass1_collect_lengths(data_root, test_mode=False, target_splits=None):
     
     all_splits = {
         'train': (data_root / 'ASVspoof5.train.tsv', data_root / "flac_T/"),
-        'dev': (data_root / 'ASVspoof5.dev.track_1.tsv', data_root / "flac_D/")
+        'dev': (data_root / 'ASVspoof5.dev.track_1.tsv', data_root / "flac_D/"),
+        'eval': (data_root / 'ASVspoof5.eval.track_1.tsv', data_root / "flac_E/")
     }
     
     # 只处理指定的splits
@@ -339,7 +341,8 @@ def pass2_extract_and_store_ragged(data_root,
     
     all_splits = {
         'train': (data_root / 'ASVspoof5.train.tsv', data_root / "flac_T/"),
-        'dev': (data_root / 'ASVspoof5.dev.track_1.tsv', data_root / "flac_D/")
+        'dev': (data_root / 'ASVspoof5.dev.track_1.tsv', data_root / "flac_D/"),
+        'eval': (data_root / 'ASVspoof5.eval.track_1.tsv', data_root / "flac_E/")
     }
     
     # 只处理指定的splits
@@ -562,10 +565,11 @@ def verify_random_samples(split_dir, sample_records):
     print("Self-check complete.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Extract WavLM features (train/dev) with PCA and sharded memmap storage")
+    parser = argparse.ArgumentParser(description="Extract WavLM features (train/dev/eval) with PCA and sharded memmap storage")
     parser.add_argument("--test", action="store_true", help="Use only 1% of data for testing")
     parser.add_argument("--dev", action="store_true", help="Extract only dev dataset features")
     parser.add_argument("--train", action="store_true", help="Extract only train dataset features")
+    parser.add_argument("--eval", dest="eval_split", action="store_true", help="Extract only eval dataset features")
     parser.add_argument("--shard-gb", type=float, default=2.0, help="Target shard size in GB (default: 2.0)")
     args = parser.parse_args()
     
@@ -574,17 +578,20 @@ def main():
     if args.test:
         print("Running in TEST MODE - using 1% of data")
     
-    # 确定要处理的数据集（仅 train/dev）
-    target_splits = None
+    # 确定要处理的数据集（可选 train/dev/eval，默认 train+dev）
+    selected = []
+    if args.train:
+        selected.append('train')
     if args.dev:
-        target_splits = ['dev']
-        print("Extracting DEV dataset only")
-    elif args.train:
-        target_splits = ['train']
-        print("Extracting TRAIN dataset only")
+        selected.append('dev')
+    if args.eval_split:
+        selected.append('eval')
+    if not selected:
+        selected = ['train', 'dev']
+        print("Extracting TRAIN and DEV datasets (default)")
     else:
-        target_splits = ['train', 'dev']
-        print("Extracting both TRAIN and DEV datasets")
+        print(f"Extracting splits: {selected}")
+    target_splits = selected
     
     # Pass 0: Fit PCA if missing
     feature_root = data_root / "features"
@@ -597,7 +604,7 @@ def main():
     else:
         print(f"Found existing PCA file: {pca_file}")
     
-    # Pass 1: Collect lengths (skip if lengths.jsonl exists)
+    # Pass 1: Collect lengths (update if missing splits in existing file)
     length_records = pass1_collect_lengths(data_root, test_mode=args.test, target_splits=target_splits)
     
     # Pass 2: Extract and store features with sharded memmap (with PCA projection)

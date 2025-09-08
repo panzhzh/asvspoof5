@@ -48,7 +48,7 @@ config = {
     "num_workers_test": 0,
 
     # I/O optimization (ragged memmap): block-wise sequential read with per-epoch block shuffle
-    "io_block_shuffle": True,
+    "io_block_shuffle": False,
     "io_block_mb": 512,
 
     # I/O cropping on load: read only needed time window (training)
@@ -57,6 +57,22 @@ config = {
     "io_crop_on_load": True,
     # Limit number of layers to read on training (e.g., 6 to save I/O). None -> read all.
     "io_train_layers": None,
+
+    # =============================================================================
+    # Early Stopping
+    # =============================================================================
+    # Enable/disable early stopping
+    "early_stopping": True,
+    # Metric to monitor: one of {"minDCF", "actDCF", "EER", "CLLR"}
+    "es_metric": "minDCF",
+    # Mode: "min" to minimize (minDCF/actDCF/CLLR), "max" to maximize
+    "es_mode": "min",
+    # Minimum change to qualify as improvement (absolute)
+    "es_min_delta": 0.002,
+    # Number of epochs with no improvement after which training stops
+    "es_patience": 3,
+    # Warmup epochs before monitoring starts
+    "es_warmup_epochs": 1,
 
     # Data augmentation
     "freq_aug": False,  # Frequency masking augmentation

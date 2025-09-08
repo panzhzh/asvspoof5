@@ -113,6 +113,21 @@ def compute_mindcf(frr, far, thresholds, Pspoof, Cmiss, Cfa):
     return min_dcf, min_c_det_threshold
 
 
+def compute_actDCF(bonafide_scores, spoof_scores, Pspoof, Cmiss, Cfa):
+    """
+    Actual DCF using threshold defined by prior and costs (per ASVspoof5 plan).
+
+    Returns normalized actual DCF and the decision threshold.
+    """
+    beta = Cmiss * (1 - Pspoof) / (Cfa * Pspoof)
+    threshold = -np.log(beta)
+    rate_miss = np.sum(bonafide_scores < threshold) / bonafide_scores.size
+    rate_fa = np.sum(spoof_scores >= threshold) / spoof_scores.size
+    act_dcf = Cmiss * (1 - Pspoof) * rate_miss + Cfa * Pspoof * rate_fa
+    act_dcf = act_dcf / np.min([Cfa * Pspoof, Cmiss * (1 - Pspoof)])
+    return act_dcf, threshold
+
+
 def compute_tDCF(bonafide_score_cm, spoof_score_cm, Pfa_asv, Pmiss_asv,
                  Pmiss_spoof_asv, cost_model, print_cost):
 

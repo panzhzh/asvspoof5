@@ -146,6 +146,25 @@ def get_loader(database_path: Path,
                                           drop_last=True,
                                           seed=seed)
 
+        # Instrumentation: report block stats for visibility
+        try:
+            block_sizes = []
+            for blk in index_blocks:
+                if not blk:
+                    continue
+                br = dsidx_to_blockrange.get(blk[0])
+                if br is None:
+                    continue
+                start, end, _ = br
+                block_sizes.append((end - start) * train_set.feature_loader.get_shard_memmap(list(per_shard.keys())[0]).dtype.itemsize)
+            if block_sizes:
+                import statistics as _stat
+                mean_mb = (sum(block_sizes) / len(block_sizes)) / (1024 * 1024)
+                med_mb = _stat.median(block_sizes) / (1024 * 1024)
+                print(f"I/O blocks: {len(index_blocks)} ; mean {mean_mb:.1f} MB ; median {med_mb:.1f} MB ; io_block_mb={io_block_mb}; io_crop_on_load={io_crop_on_load}")
+        except Exception:
+            pass
+
         # Aggregated I/O collate: read contiguous block(s) per shard for current batch
         # Simple per-shard block cache to reuse contiguous reads across consecutive batches
         block_cache: dict[tuple[str, int, int], dict[str, object]] = {}
@@ -497,6 +516,36 @@ def main(args: argparse.Namespace) -> None:
     best_dev_cllr = 1.
     n_swa_update = 0
 
+    # Early stopping setup
+    es_enabled = bool(config.get("early_stopping", False))
+    es_metric_name = str(config.get("es_metric", "minDCF"))
+    es_mode = str(config.get("es_mode", "min"))
+    es_min_delta = float(config.get("es_min_delta", 0.002))
+    es_patience = int(config.get("es_patience", 3))
+    es_warmup = int(config.get("es_warmup_epochs", 1))
+    es_best = None
+    es_wait = 0
+
+    def _metric_value():
+        if es_metric_name.lower() == "mindcf":
+            return dev_min_dcf
+        if es_metric_name.lower() == "actdcf":
+            return dev_actdcf
+        if es_metric_name.lower() == "eer":
+            return dev_eer
+        if es_metric_name.lower() == "cllr":
+            return dev_cllr
+        # default
+        return dev_min_dcf
+
+    def _is_improved(curr, best):
+        if best is None:
+            return True
+        if es_mode == "min":
+            return curr < (best - es_min_delta)
+        else:
+            return curr > (best + es_min_delta)
+
     # make directory for metric logging
     metric_path = model_tag / "metrics"
     os.makedirs(metric_path, exist_ok=True)
@@ -512,19 +561,20 @@ def main(args: argparse.Namespace) -> None:
         produce_evaluation_file(dev_loader, model, device, metric_path/"dev_score.txt", dev_trial_path)
         del dev_loader
         gc.collect()
-        dev_dcf, dev_eer, dev_cllr = calculate_minDCF_EER_CLLR(
+        dev_min_dcf, dev_eer, dev_cllr, dev_actdcf = calculate_minDCF_EER_CLLR(
             cm_scores_file=metric_path/"dev_score.txt",
             output_file=metric_path/"dev_DCF_EER_{}epo.txt".format(epoch),
             printout=False)
-        print("DONE.\nLoss:{:.5f}, dev_eer: {:.3f}, dev_dcf:{:.5f} , dev_cllr:{:.5f}".format(
-            running_loss, dev_eer, dev_dcf, dev_cllr))
+        print("DONE.\nLoss:{:.5f}\n  minDCF: {:.6f} | actDCF: {:.6f} | EER: {:.3f}% | CLLR: {:.6f} bits".format(
+            running_loss, dev_min_dcf, dev_actdcf, dev_eer * 100.0, dev_cllr))
         writer.add_scalar("loss", running_loss, epoch)
-        writer.add_scalar("dev_eer", dev_eer, epoch)
-        writer.add_scalar("dev_dcf", dev_dcf, epoch)
+        writer.add_scalar("dev_minDCF", dev_min_dcf, epoch)
+        writer.add_scalar("dev_actDCF", dev_actdcf, epoch)
+        writer.add_scalar("dev_eer", dev_eer * 100.0, epoch)
         writer.add_scalar("dev_cllr", dev_cllr, epoch)
-        torch.save(model.state_dict(), model_save_path / "epoch_{}_{:03.3f}.pth".format(epoch, dev_eer))
+        torch.save(model.state_dict(), model_save_path / "epoch_{}_{:05.2f}EER.pth".format(epoch, dev_eer * 100.0))
 
-        best_dev_dcf = min(dev_dcf, best_dev_dcf)
+        best_dev_dcf = min(dev_min_dcf, best_dev_dcf)
         best_dev_cllr = min(dev_cllr, best_dev_cllr)
         if best_dev_eer >= dev_eer:
             print("best model find at epoch", epoch)
@@ -536,6 +586,22 @@ def main(args: argparse.Namespace) -> None:
         writer.add_scalar("best_dev_eer", best_dev_eer, epoch)
         writer.add_scalar("best_dev_tdcf", best_dev_dcf, epoch)
         writer.add_scalar("best_dev_cllr", best_dev_cllr, epoch)
+
+        # Early stopping check
+        if es_enabled and epoch >= es_warmup:
+            curr = _metric_value()
+            if _is_improved(curr, es_best):
+                es_best = curr
+                es_wait = 0
+                # Save best-by-ES checkpoint
+                torch.save(model.state_dict(), model_save_path / f"best_ES_{es_metric_name}_{curr:.6f}.pth")
+                print(f"[ES] New best {es_metric_name}={curr:.6f} at epoch {epoch}")
+            else:
+                es_wait += 1
+                print(f"[ES] No improvement on {es_metric_name} ({curr:.6f}); wait {es_wait}/{es_patience}")
+                if es_wait >= es_patience:
+                    print(f"Early stopping at epoch {epoch} (best {es_metric_name}={es_best:.6f})")
+                    break
 
 
 if __name__ == "__main__":

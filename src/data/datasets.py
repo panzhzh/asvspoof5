@@ -263,19 +263,29 @@ class TestDataset(Dataset):
 
 
 class EvalDataset(Dataset):
-    """Evaluation dataset that loads audio files and extracts WavLM features on-the-fly.
+    """Evaluation dataset that loads audio and extracts WavLM features on-the-fly.
 
-    Returns a FloatTensor of shape [6, T, 768] where T == target_frames.
+    - layers_to_use: number of hidden layers to extract starting from layer 1 (exclude embedding)
+    - pca_npz: optional path to PCA npz (per-layer means/components) to project 768->D_proj
+
+    Output shape: [L, T, D] with L=layers_to_use and D=768 (no PCA) or D=proj_dim (with PCA)
+    After padding/cropping: T == target_frames.
     """
-    def __init__(self, list_IDs, audio_dir, target_frames: int = 512):
+    def __init__(self, list_IDs, audio_dir, target_frames: int = 512, layers_to_use: int = 6, pca_npz: str | None = None):
         self.list_IDs = list_IDs
         self.audio_dir = Path(audio_dir)
         self.target_frames = int(target_frames)
+        self.layers_to_use = int(layers_to_use)
         
         # Initialize WavLM model and processor for real-time feature extraction
         self.wavlm_model = None
         self.wavlm_processor = None
         self._init_wavlm()
+
+        # Optional PCA projection
+        self.pca = None
+        if pca_npz is not None:
+            self._load_pca(Path(pca_npz))
     
     def _init_wavlm(self):
         """Initialize WavLM model and processor"""
@@ -306,8 +316,23 @@ class EvalDataset(Dataset):
         
         return audio
     
+    def _load_pca(self, pca_path: Path):
+        data = np.load(pca_path)
+        n_layers = int(data.get('n_layers', 8))
+        in_dim = int(data.get('in_dim', 768))
+        # Pack means and components into lists for fast access
+        means = [data[f"mean_{l}"] for l in range(n_layers)]
+        comps = [data[f"components_{l}"] for l in range(n_layers)]
+        self.pca = {
+            'n_layers': n_layers,
+            'in_dim': in_dim,
+            'means': means,
+            'comps': comps,
+            'out_dim': comps[0].shape[0] if len(comps) > 0 else in_dim,
+        }
+
     def _extract_wavlm_features(self, audio_path):
-        """Extract WavLM L1-L6 features from audio file"""
+        """Extract WavLM L1..L features from audio file (then optional PCA)."""
         # Load and preprocess audio
         audio = self._load_and_preprocess_audio(audio_path)
         
@@ -323,11 +348,27 @@ class EvalDataset(Dataset):
         with torch.inference_mode():
             outputs = self.wavlm_model(**inputs, output_hidden_states=True)
         
-        # Get L1-L6 (indices 1-6 in hidden_states)
-        hidden_states = outputs.hidden_states[1:7]  # Skip layer 0 (input embeddings)
-        features = torch.stack(hidden_states, dim=1)  # [1, 6, seq_len, 768]
+        # Get L1..L (indices 1..L)
+        L = max(1, int(self.layers_to_use))
+        hidden_states = outputs.hidden_states[1:1+L]  # Skip layer 0 (input embeddings)
+        features = torch.stack(hidden_states, dim=1)  # [1, L, seq_len, 768]
+        feats = features.squeeze(0).cpu().numpy().astype(np.float32)  # [L, seq_len, 768]
 
-        return features.squeeze(0).cpu().numpy().astype(np.float16)  # [6, seq_len, 768]
+        # Optional PCA projection per layer
+        if self.pca is not None:
+            n_layers_pca = int(self.pca['n_layers'])
+            means = self.pca['means']
+            comps = self.pca['comps']
+            L_use = min(L, n_layers_pca)
+            proj_layers = []
+            for l in range(L_use):
+                X = feats[l]  # [T,768]
+                Xc = X - means[l]
+                Y = Xc @ comps[l].T  # [T, Dproj]
+                proj_layers.append(Y.astype(np.float32))
+            feats = np.stack(proj_layers, axis=0)  # [L_use, T, Dproj]
+
+        return feats
     
     def __len__(self):
         return len(self.list_IDs)

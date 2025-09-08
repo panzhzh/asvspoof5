@@ -44,18 +44,14 @@ def produce_evaluation_file(data_loader: DataLoader, model, device: torch.device
         score_list.extend(batch_score.tolist())
 
     with open(save_path, "w") as fh:
-        fh.write("filename\tcm-score\tcm_label\n")  # Header
+        fh.write("filename\tcm-score\n")  # evaluation-package expects exactly two columns
         for fn, sco, trl in zip(fname_list, score_list, trial_lines):
             fields = trl.strip().split()
-            # TSV format: original_id file_id gender codec_type track original_speaker codec algorithm label -
-            if len(fields) >= 9:
-                original_id = fields[0]  # E_1607
-                file_id = fields[1]      # E_0009538969
-                label = fields[8]        # spoof/bonafide
+            if len(fields) >= 2:
+                file_id = fields[1]
                 assert fn == file_id, f"File ID mismatch: {fn} != {file_id}"
-                fh.write("{}\t{}\t{}\n".format(file_id, sco, label))
+                fh.write("{}\t{}\n".format(file_id, sco))
             else:
-                # Fallback for shorter format
                 print(f"Warning: Unexpected line format: {trl.strip()}")
                 continue
     print("Scores saved to {}".format(save_path))
@@ -97,13 +93,37 @@ def main(args: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device: {}".format(device))
     
-    # Define model architecture
-    model = get_model(model_config, device)
-    
-    # Load model weights
+    # Inspect checkpoint to decide eval feature shape (layers/D)
     model_path = Path(args.model_path)
     print(f"Loading model from: {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    ckpt = torch.load(model_path, map_location="cpu")
+    # Defaults
+    ckpt_layers = 6
+    ckpt_in_dim = 768
+    if isinstance(ckpt, dict):
+        if 'layer_weights' in ckpt:
+            try:
+                ckpt_layers = int(ckpt['layer_weights'].shape[0])
+            except Exception:
+                pass
+        if 'adapter_proj.weight' in ckpt:
+            try:
+                ckpt_in_dim = int(ckpt['adapter_proj.weight'].shape[1])
+            except Exception:
+                pass
+
+    # Define model architecture and adapt shapes before loading weights
+    model = get_model(model_config, device)
+    try:
+        # Adapt input fusion and adapter to checkpoint shapes (before loading)
+        if hasattr(model, 'layer_weights') and model.layer_weights.numel() != ckpt_layers:
+            model.layer_weights = torch.nn.Parameter(torch.zeros(ckpt_layers, device=device, dtype=torch.float32))
+        if hasattr(model, 'adapter_proj') and getattr(model.adapter_proj, 'in_channels', None) != ckpt_in_dim:
+            out_ch = model.adapter_proj.out_channels
+            model.adapter_proj = torch.nn.Conv1d(in_channels=ckpt_in_dim, out_channels=out_ch, kernel_size=1, bias=False).to(device)
+    except Exception as e:
+        print(f"Warning: shape adaptation before load failed: {e}")
+    model.load_state_dict(ckpt, strict=False)
     model.eval()
     
     # Prepare evaluation dataset
@@ -112,10 +132,24 @@ def main(args: argparse.Namespace) -> None:
         file_eval = file_eval[:int(len(file_eval) * 0.01)]
     print("no. evaluation files:", len(file_eval))
     
-    # Use real-time WavLM extraction
+    # Use real-time WavLM extraction; align to checkpoint input shape
     print("Using real-time WavLM extraction")
     audio_dir = database_path / "flac_E"
-    eval_set = EvalDataset(list_IDs=file_eval, audio_dir=audio_dir)
+    target_frames = int(model_config.get("target_frames", 512))
+    feature_root = Path(config["feature_path"]) if "feature_path" in config else (database_path / "features")
+    pca_npz = None
+    if ckpt_in_dim == 288:
+        # Use PCA to project WavLM to 288 dims per layer
+        candidate = feature_root / "pca_l8_d288.npz"
+        if candidate.exists():
+            pca_npz = str(candidate)
+        else:
+            print(f"Warning: expected PCA file not found at {candidate}; will attempt without PCA (may mismatch)")
+    eval_set = EvalDataset(list_IDs=file_eval,
+                           audio_dir=audio_dir,
+                           target_frames=target_frames,
+                           layers_to_use=ckpt_layers,
+                           pca_npz=pca_npz)
     
     bs_test = int(config.get("batch_size_test", 32))
     nw_test = int(config.get("num_workers_test", 0))
@@ -145,15 +179,18 @@ def main(args: argparse.Namespace) -> None:
     # Create temporary key file with header and matching samples
     temp_key_file = output_path.parent / "temp_key.tsv"
     with open(key_file, 'r') as f_in, open(temp_key_file, 'w') as f_out:
-        f_out.write("original_id\tfilename\tgender\tcodec_type\ttrack\toriginal_speaker\tcodec\talgorithm\tkey_label\textra\n")
+        # Strict two-column header as evaluation-package expects
+        f_out.write("filename\tcm-label\n")
         eval_file_set = set(file_eval)
         matched_count = 0
         for line in f_in:
             fields = line.strip().split()
-            if len(fields) >= 2 and fields[1] in eval_file_set:
-                f_out.write('\t'.join(fields) + '\n')
-                matched_count += 1
-    
+            if len(fields) >= 9:
+                file_id = fields[1]
+                label = fields[8]
+                if file_id in eval_file_set:
+                    f_out.write(f"{file_id}\t{label}\n")
+                    matched_count += 1
     print(f"Matched {matched_count} key entries out of {len(file_eval)} eval files")
     
     result = subprocess.run([

@@ -24,16 +24,18 @@ def calculate_minDCF_EER_CLLR(cm_scores_file,
     eer_cm, frr, far, thresholds = compute_eer(bona_cm, spoof_cm)
     cllr_cm = calculate_CLLR(bona_cm, spoof_cm)
     minDCF_cm, _ = compute_mindcf(frr, far, thresholds, Pspoof, dcf_cost_model['Cmiss'], dcf_cost_model['Cfa'])
+    actDCF_cm, _ = compute_actDCF(bona_cm, spoof_cm, Pspoof, dcf_cost_model['Cmiss'], dcf_cost_model['Cfa'])
 
     if printout:
         with open(output_file, "w") as f_res:
             f_res.write('\nCM SYSTEM\n')
-            f_res.write('\tmin DCF \t\t= {} % (min DCF for countermeasure)\n'.format(minDCF_cm))
-            f_res.write('\tEER\t\t= {:8.9f} % (EER for countermeasure)\n'.format(eer_cm * 100))
-            f_res.write('\tCLLR\t\t= {:8.9f} % (CLLR for countermeasure)\n'.format(cllr_cm * 100))
+            f_res.write('\tminDCF\t\t= {:8.6f} (min DCF)\n'.format(minDCF_cm))
+            f_res.write('\tactDCF\t\t= {:8.6f} (actual DCF)\n'.format(actDCF_cm))
+            f_res.write('\tEER\t\t= {:8.6f} % (EER)\n'.format(eer_cm * 100))
+            f_res.write('\tCLLR\t\t= {:8.6f} bits (CLLR)\n'.format(cllr_cm))
         os.system(f"cat {output_file}")
 
-    return minDCF_cm, eer_cm, cllr_cm
+    return minDCF_cm, eer_cm, cllr_cm, actDCF_cm
 
 
 def calculate_aDCF_tdcf_tEER(cm_scores_file,
@@ -114,4 +116,3 @@ def calculate_aDCF_tdcf_tEER(cm_scores_file,
         os.system(f"cat {output_file}")
 
     return adcf, min_tDCF, teer
-

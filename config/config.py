@@ -117,6 +117,33 @@ config = {
 }
 
 
+# -----------------------------------------------------------------------------
+# C2S (Content-to-Source) configuration namespace
+# Minimal switches for stage-0/1 (extraction) + future toggles for scoring
+# -----------------------------------------------------------------------------
+c2s = {
+    # Enable C2S subsystem
+    "enable": True,
+
+    # Components for excitation features E (32-d target)
+    # all | f0_hnr_slope | f0_hnr_only (currently only "all" is implemented)
+    "components": "all",
+
+    # Frame geometry (must match content features C)
+    "e_stride_ms": 20,   # hop 20 ms -> hop_length = 320 @ 16kHz
+    "e_win_ms": 25,      # window 25 ms -> win_length = 400 @ 16kHz
+    "e_dim": 32,
+
+    # Extraction I/O
+    # Where to write ragged memmap shards + index.jsonl for E and V
+    "out_root": str(PROJECT_ROOT / "data" / "ASVspoof5" / "features"),
+    "shard_gb": 2.0,     # target shard size (GB)
+
+    # Splits to extract by default (train/dev/eval)
+    "extract_splits": ["train", "dev", "eval"],
+}
+
+
 def get_config():
     """
     Get the configuration dictionary.

@@ -141,7 +141,21 @@ c2s = {
 
     # Splits to extract by default (train/dev/eval)
     "extract_splits": ["train", "dev", "eval"],
+
+    # Training-time integration (enabled by default)
+    "enable_train": True,
+    "train_mode": "loss_weight",
+    "pca_dim": 64,
+    "ridge_alpha": 1e-2,
+    "var_floor": 1e-4,
+    "train_voiced_only": True,
+    "train_weight_gamma": 0.2,
+    "train_weight_w_min": 0.5,
+    "train_weight_w_max": 1.5,
 }
+
+# Use eval split for in-training validation (instead of dev)
+use_eval_for_dev = True
 
 
 def get_config():

@@ -35,6 +35,34 @@ from src.utils import create_optimizer, seed_worker, set_seed, str_to_bool
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+# --- Minimal RaggedIndex (embedded) for reading E/V ---
+class RaggedIndex:
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.index = self.root / "index.jsonl"
+        self.records = {}
+        self.mm_cache = {}
+        with self.index.open() as f:
+            for line in f:
+                r = json.loads(line)
+                self.records[r["utt_id"]] = r
+
+    def _mm(self, shard: str):
+        if shard not in self.mm_cache:
+            self.mm_cache[shard] = np.lib.format.open_memmap(self.root / shard, mode='r')
+        return self.mm_cache[shard]
+
+    def get(self, uid: str):
+        r = self.records[uid]
+        mm = self._mm(r["shard"])
+        off = int(r["offset_elems"])
+        cnt = int(r["elem_count"])
+        T = int(r.get("T", r.get("real_len")))
+        D = int(r["D"]) if "D" in r else cnt // T
+        flat = mm[off:off + cnt]
+        return np.asarray(flat).reshape(T, D)
+
+
 def get_model(model_config: dict, device: torch.device):
     """Define DNN model architecture"""
     module = import_module("src.models.{}".format(model_config["architecture"]))
@@ -53,10 +81,17 @@ def get_loader(database_path: Path,
                dev_limit: int | None = None):
     """Create training DataLoader and a builder for dev DataLoader (on-demand)."""
     trn_feature_path = feature_path / "train"
-    dev_feature_path = feature_path / "dev"
+    # Use eval split for validation if configured
+    use_eval = False
+    try:
+        from config.config import use_eval_for_dev as _USE_EVAL_FOR_DEV
+        use_eval = bool(_USE_EVAL_FOR_DEV)
+    except Exception:
+        use_eval = False
+    dev_feature_path = feature_path / ("eval" if use_eval else "dev")
 
     trn_list_path = database_path / "ASVspoof5.train.tsv"
-    dev_trial_path = database_path / "ASVspoof5.dev.track_1.tsv"
+    dev_trial_path = database_path / ("ASVspoof5.eval.track_1.tsv" if use_eval else "ASVspoof5.dev.track_1.tsv")
 
     d_label_trn, file_train = genSpoof_list(dir_meta=trn_list_path, is_train=True, is_eval=False)
     if test_mode:
@@ -76,13 +111,26 @@ def get_loader(database_path: Path,
     io_train_layers = config.get("io_train_layers", None)
     # When using ragged_memmap + block shuffle, return pointer to enable batch-level aggregated I/O
     return_pointer = bool(io_block_shuffle)
-    train_set = TrainDataset(list_IDs=file_train, labels=d_label_trn, feature_dir=trn_feature_path, target_frames=target_frames, return_pointer=return_pointer)
+    # If C2S training enabled, also return key for per-sample weighting
+    c2s_enable_train = bool(C2S_CFG.get("enable_train", False)) if 'C2S_CFG' in globals() else False
+    train_set = TrainDataset(
+        list_IDs=file_train,
+        labels=d_label_trn,
+        feature_dir=trn_feature_path,
+        target_frames=target_frames,
+        return_pointer=return_pointer,
+        return_key=c2s_enable_train,
+    )
     gen = torch.Generator()
     gen.manual_seed(seed)
     # Variable-length collate for training (returns list of tensors)
     def collate_varlen_train(batch):
+        # Support (x,y) or (x,y,key)
+        if len(batch[0]) == 3:
+            feats, labels, keys = zip(*batch)
+            return list(feats), torch.tensor(labels, dtype=torch.long), list(keys)
         feats, labels = zip(*batch)
-        return list(feats), torch.tensor(labels, dtype=torch.long)
+        return list(feats), torch.tensor(labels, dtype=torch.long), None
 
     # Build block-wise batch sampler for near-sequential disk access (ragged_memmap only)
     if io_block_shuffle and getattr(train_set.feature_loader, "format_type", None) == "ragged_memmap":
@@ -363,16 +411,39 @@ def train_epoch(trn_loader: DataLoader,
     except Exception:
         pass
 
-    for batch_list, batch_y in tqdm(trn_loader):
+    for batch in tqdm(trn_loader):
+        if len(batch) == 3:
+            batch_list, batch_y, batch_keys = batch
+        else:
+            batch_list, batch_y = batch
+            batch_keys = None
         batch_size = len(batch_list)
         num_total += batch_size
 
         batch_x = gpu_time_pad_crop(batch_list, target_frames, device, is_train=True)
         batch_y = batch_y.view(-1).type(torch.int64).to(device, non_blocking=True)
 
+        # Optional per-sample weights from precomputed utter-level map
+        sample_w = None
+        if batch_keys is not None and isinstance(batch_keys, list) and isinstance(batch_keys[0], str):
+            # fetch weights if available
+            w = [1.0] * batch_size
+            # try to capture closure variable if present
+            try:
+                c2s_wm = globals().get('_C2S_WEIGHT_MAP', None)
+                if c2s_wm is not None:
+                    w = [float(c2s_wm.get(k, 1.0)) for k in batch_keys]
+            except Exception:
+                pass
+            sample_w = torch.tensor(w, dtype=torch.float32, device=device)
+
         with autocast():
             _, batch_out = model(batch_x, Freq_aug=str_to_bool(config["freq_aug"]))
-            batch_loss = criterion(batch_out, batch_y)
+            if sample_w is None:
+                batch_loss = criterion(batch_out, batch_y)
+            else:
+                per_sample = F.cross_entropy(batch_out, batch_y, weight=torch.FloatTensor([0.1, 0.9]).to(device), reduction='none')
+                batch_loss = (per_sample * sample_w).mean()
         running_loss += batch_loss.item() * batch_size
         optim.zero_grad()
         scaler.scale(batch_loss).backward()
@@ -480,7 +551,12 @@ def main(args: argparse.Namespace) -> None:
                     bs.set_epoch(0)
             except Exception:
                 pass
-            batch_list, _ = next(iter(trn_loader))
+            batch = next(iter(trn_loader))
+            # Collate may return (feats, labels) or (feats, labels, keys)
+            if isinstance(batch, (list, tuple)):
+                batch_list = batch[0]
+            else:
+                batch_list = batch
 
             # GPU pad/crop like in training to form [B, L, T, D]
             def gpu_time_pad_crop(batch_list_local, target_len, device_local, is_train=False):
@@ -549,6 +625,111 @@ def main(args: argparse.Namespace) -> None:
     # make directory for metric logging
     metric_path = model_tag / "metrics"
     os.makedirs(metric_path, exist_ok=True)
+
+    # ---- Prepare C2S utter-level weights if enabled ----
+    _C2S_WEIGHT_MAP = None
+    try:
+        c2s_cfg = config.get("c2s", {}) if isinstance(config, dict) else {}
+        if bool(c2s_cfg.get("enable_train", False)) and str(c2s_cfg.get("train_mode", "none")).lower() == "loss_weight":
+            from src.data.datasets import FeatureLoader
+            # Load C, E, V indices
+            c_loader = FeatureLoader(feature_path / "train")
+            e_index = RaggedIndex(feature_path / "E" / "train")
+            v_index = RaggedIndex(feature_path / "V" / "train")
+            # Get train list + labels
+            d_label_trn, file_train = genSpoof_list(dir_meta=database_path / "ASVspoof5.train.tsv", is_train=True, is_eval=False)
+            # Fit PCA with small sample to control memory
+            pca_dim = int(c2s_cfg.get("pca_dim", 64))
+            ridge_alpha = float(c2s_cfg.get("ridge_alpha", 1e-2))
+            var_floor = float(c2s_cfg.get("var_floor", 1e-4))
+            # Select bonafide subset
+            bon = [u for u in file_train if d_label_trn.get(u, 0) == 1]
+            rng = np.random.default_rng(0)
+            sample_ratio = 0.1
+            sel = bon if len(bon) < 2000 else list(rng.choice(bon, size=int(len(bon)*sample_ratio), replace=False))
+            # Incremental PCA
+            from sklearn.decomposition import IncrementalPCA
+            pca = IncrementalPCA(n_components=pca_dim, batch_size=4096)
+            for uid in sel:
+                C_LTD = c_loader.get_features(uid)
+                C_TD = C_LTD.mean(axis=0).astype(np.float32)
+                T = C_TD.shape[0]
+                if T <= 0:
+                    continue
+                idx = rng.choice(T, size=max(1, int(T*0.2)), replace=False)
+                pca.partial_fit(C_TD[idx])
+            # Ridge closed form accumulators
+            XT_X = None
+            XT_Y = None
+            for uid in sel:
+                C_LTD = c_loader.get_features(uid)
+                C_TD = C_LTD.mean(axis=0).astype(np.float32)
+                E_TD = e_index.get(uid).astype(np.float32)
+                T = min(C_TD.shape[0], E_TD.shape[0])
+                if T <= 0:
+                    continue
+                C64 = pca.transform(C_TD[:T])
+                Xb = np.concatenate([C64, np.ones((T,1), dtype=np.float32)], axis=1)
+                Y = E_TD[:T]
+                xx = Xb.T @ Xb
+                xy = Xb.T @ Y
+                XT_X = xx if XT_X is None else XT_X + xx
+                XT_Y = xy if XT_Y is None else XT_Y + xy
+            if XT_X is None:
+                _C2S_WEIGHT_MAP = None
+            else:
+                XT_X.flat[::XT_X.shape[0]+1] += ridge_alpha
+                W = np.linalg.solve(XT_X, XT_Y)
+                A = W[:-1].T  # [32,pca_dim]
+                b = W[-1].astype(np.float32)
+                # variance
+                var_acc = np.zeros((32,), dtype=np.float64)
+                cnt = 0
+                for uid in sel:
+                    C_LTD = c_loader.get_features(uid)
+                    C_TD = C_LTD.mean(axis=0).astype(np.float32)
+                    E_TD = e_index.get(uid).astype(np.float32)
+                    T = min(C_TD.shape[0], E_TD.shape[0])
+                    if T <= 0:
+                        continue
+                    C64 = pca.transform(C_TD[:T])
+                    pred = (C64 @ A.T + b)
+                    resid = (E_TD[:T] - pred)
+                    var_acc += (resid ** 2).mean(axis=0)
+                    cnt += 1
+                sigma = np.sqrt(np.maximum(var_acc / max(1, cnt), var_floor)).astype(np.float32)
+                # Weights for all train uttrs
+                wm = {}
+                for uid in file_train:
+                    C_LTD = c_loader.get_features(uid)
+                    C_TD = C_LTD.mean(axis=0).astype(np.float32)
+                    E_TD = e_index.get(uid).astype(np.float32)
+                    V_T = v_index.get(uid).astype(np.uint8).reshape(-1)
+                    T = min(C_TD.shape[0], E_TD.shape[0], V_T.shape[0])
+                    if T <= 0:
+                        wm[uid] = 1.0
+                        continue
+                    C64 = pca.transform(C_TD[:T])
+                    pred = (C64 @ A.T + b)
+                    z = (E_TD[:T] - pred) / sigma
+                    nll = 0.5 * (z ** 2).sum(axis=1) + 0.5 * np.log((sigma ** 2)).sum()
+                    if bool(c2s_cfg.get("train_voiced_only", True)) and V_T[:T].sum() > 0:
+                        n = nll[V_T[:T] > 0]
+                    else:
+                        n = nll
+                    wm[uid] = float(n.mean()) if n.size > 0 else float(nll.mean())
+                vals = np.array(list(wm.values()), dtype=np.float32)
+                z = (vals - vals.mean()) / (vals.std() + 1e-6)
+                gamma = float(c2s_cfg.get("train_weight_gamma", 0.2))
+                w_min = float(c2s_cfg.get("train_weight_w_min", 0.5))
+                w_max = float(c2s_cfg.get("train_weight_w_max", 1.5))
+                ws = np.clip(1.0 + gamma * z, w_min, w_max)
+                _C2S_WEIGHT_MAP = {k: float(w) for k, w in zip(wm.keys(), ws)}
+                # expose to training loop via module globals
+                globals()['_C2S_WEIGHT_MAP'] = _C2S_WEIGHT_MAP
+                print("[C2S] Train-time utter weights prepared.")
+    except Exception as e:
+        print(f"[C2S] disabled: {e}")
 
     # Training
     for epoch in range(config["num_epochs"]):

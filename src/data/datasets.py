@@ -169,12 +169,13 @@ class TrainDataset(Dataset):
     Returns a FloatTensor of shape [L, T, D] (no time pad/crop here).
     Time pad/crop will be performed on GPU in the training loop.
     """
-    def __init__(self, list_IDs, labels, feature_dir, target_frames: int = 512, return_pointer: bool = False):
+    def __init__(self, list_IDs, labels, feature_dir, target_frames: int = 512, return_pointer: bool = False, return_key: bool = False):
         self.list_IDs = list_IDs
         self.labels = labels
         self.feature_loader = FeatureLoader(feature_dir)
         self.target_frames = int(target_frames)  # kept for reference; not applied here
         self.return_pointer = bool(return_pointer)
+        self.return_key = bool(return_key)
 
     def __len__(self):
         return len(self.list_IDs)
@@ -216,6 +217,8 @@ class TrainDataset(Dataset):
                 'ds_idx': int(index),
             }
             y = self.labels[key]
+            if self.return_key:
+                return ptr, y, key
             return ptr, y
         else:
             # Load pre-extracted features [L, real_len, D]; no pad/crop here
@@ -223,6 +226,8 @@ class TrainDataset(Dataset):
             # Convert to tensor (writable)
             x_inp = torch.tensor(features, dtype=torch.float32)
             y = self.labels[key]
+            if self.return_key:
+                return x_inp, y, key
             return x_inp, y
 
 

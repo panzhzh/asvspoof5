@@ -192,6 +192,7 @@ saved_models/
 weights/
 exp/
 experiments/
+models
 
 # Training logs and outputs
 logs/

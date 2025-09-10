@@ -24,6 +24,7 @@ import subprocess
 import sys
 
 import numpy as np
+from tqdm import tqdm
 
 
 def exist_nonempty(path: Path) -> bool:
@@ -169,7 +170,7 @@ def _extract_e_v(cfg: dict, splits: Iterable[str]) -> None:
         mean = None
         M2 = None
         count = 0
-        for uid in ids:
+        for uid in tqdm(ids, desc=f"Extracting E/V for {sp}"):
             p = wav_dir / f"{uid}.flac"
             if not p.exists():
                 p = wav_dir / f"{uid}.wav"
@@ -223,7 +224,7 @@ def _fit_buckets(cfg: dict, out_dir: Path, k: int, sample_ratio: float) -> None:
     def iter_frames():
         buf = []
         acc = 0
-        for uid in bon_ids:
+        for uid in tqdm(bon_ids, desc="Processing bonafide utterances for PCA/KMeans"):
             C_ltd = loader.get_features(uid)
             C_td = C_ltd.mean(axis=0).astype(np.float32)
             T = C_td.shape[0]
@@ -292,7 +293,7 @@ def _fit_lin_gauss(cfg: dict, pca_npz: Path, kmeans_npz: Path, out_npz: Path, al
     v_index = _RaggedIndex(v_root)
 
     # Pass 1: accumulate
-    for uid in bon_ids:
+    for uid in tqdm(bon_ids, desc="Pass 1: Accumulating linear-Gaussian statistics"):
         try:
             C_ltd = c_loader.get_features(uid)
             C_td = C_ltd.mean(axis=0).astype(np.float32)
@@ -343,7 +344,7 @@ def _fit_lin_gauss(cfg: dict, pca_npz: Path, kmeans_npz: Path, out_npz: Path, al
 
     var_acc = torch.zeros((K, De), dtype=torch.float64, device=device)
     var_cnt = torch.zeros((K,), dtype=torch.int64, device=device)
-    for uid in bon_ids:
+    for uid in tqdm(bon_ids, desc="Pass 2: Computing variance statistics"):
         try:
             C_ltd = c_loader.get_features(uid)
             C_td = C_ltd.mean(axis=0).astype(np.float32)
@@ -422,7 +423,7 @@ def _score_splits(cfg: dict, lin_gauss_npz: Path, splits: List[str], out_path: P
         e_index = _RaggedIndex(feat_root / "E" / split)
         v_index = _RaggedIndex(feat_root / "V" / split)
         # Batched over utterances to better utilize GPU
-        for i in range(0, len(ids), max(1, int(batch_utts))):
+        for i in tqdm(range(0, len(ids), max(1, int(batch_utts))), desc=f"Scoring {split} split"):
             batch_ids = ids[i:i+max(1, int(batch_utts))]
             C_list = []
             E_list = []
@@ -558,7 +559,10 @@ def _calibrate_and_eval(cfg: dict, scores_path: Path, out_jsonl: Path, split: st
     # print metrics via evaluation-package
     eval_dir = Path(__file__).resolve().parents[1] / "evaluation-package"
     print("\nEvaluation metrics (from evaluation-package):\n")
-    subprocess.check_call([sys.executable, "evaluation.py", "--m", "t1", "--cm", str(two_col), "--cm_keys", str(key_path)], cwd=eval_dir)
+    # Use absolute paths
+    two_col_abs = two_col.resolve()
+    key_path_abs = key_path.resolve()
+    subprocess.check_call([sys.executable, "evaluation.py", "--m", "t1", "--cm", str(two_col_abs), "--cm_keys", str(key_path_abs)], cwd=eval_dir)
 
 
 def main():
